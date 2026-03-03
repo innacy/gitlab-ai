@@ -1,0 +1,81 @@
+# GitLab AI CLI Configuration
+# See: gitlab-ai help config
+
+# GitLab Configuration
+gitlab:
+  base_url: "https://gitlab.widas.de/"
+  api_version: "v4"
+  default_project: ""
+
+# AI Provider Configuration (Anthropic Claude)
+ai:
+  provider: "anthropic"
+  anthropic:
+    api_key: "" # Put your key here, or use api_key_env
+    api_key_env: "ANTHROPIC_API_KEY" # Env var fallback
+    model: "claude-sonnet-4-20250514"
+    max_tokens: 8192
+    temperature: 0.7
+
+# Review Configuration
+review:
+  template:
+    sections:
+      - name: "Summary"
+        prompt: "Provide a brief summary of the changes"
+        required: true
+      - name: "Code Quality"
+        prompt: "Assess code quality, readability, and maintainability"
+        required: true
+      - name: "Security Concerns"
+        prompt: "Identify any security vulnerabilities or risks"
+        required: true
+      - name: "Performance Impact"
+        prompt: "Evaluate potential performance implications"
+        required: false
+      - name: "Testing Coverage"
+        prompt: "Comment on test coverage and quality"
+        required: true
+      - name: "Suggestions"
+        prompt: "Provide actionable improvement suggestions"
+        required: true
+      - name: "Approval Recommendation"
+        prompt: "Recommend approve, request changes, or reject with reasoning"
+        required: true
+
+  output:
+    directory: "./reviews"
+    filename_pattern: "{project}_{mr_number}.md"
+    include_metadata: true
+    include_diff: false
+
+  filters:
+    exclude_files:
+      - "*.lock"
+      - "vendor/*"
+      - "*.generated.go"
+
+# Issue Configuration
+issues:
+  output:
+    directory: "./issues"
+    filename_pattern: "{project}_issues_{date}.md"
+  fields:
+    - "id"
+    - "title"
+    - "description"
+    - "state"
+    - "labels"
+    - "assignee"
+    - "created_at"
+    - "updated_at"
+    - "due_date"
+    - "milestone"
+    - "web_url"
+
+# CLI Configuration
+cli:
+  color_output: true
+  markdown_rendering: true
+  verbose: false
+  confirm_before_post: true

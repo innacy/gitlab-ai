@@ -1,0 +1,33 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test/build artifacts
+coverage.out
+coverage.html
+*.test
+*.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated review & issue files
+*.md
+!docs/*.md
+!configs/*.yaml
+
+# Config with secrets (lives in ~/.gitlab-ai/)
+config.yaml
+!configs/default.yaml

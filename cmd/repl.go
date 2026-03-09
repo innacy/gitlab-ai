@@ -1,20 +1,24 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/briandowns/spinner"
+	"github.com/chzyer/readline"
 	"github.com/fatih/color"
 
 	"gitlab-ai/internal/models"
 	"gitlab-ai/pkg/ai"
 	"gitlab-ai/pkg/config"
+	projectctx "gitlab-ai/pkg/context"
 	"gitlab-ai/pkg/gitlab"
 	"gitlab-ai/pkg/output"
 )
@@ -23,11 +27,21 @@ import (
 type replState struct {
 	cfg        *config.AppConfig
 	glClient   *gitlab.Client
-	aiClient   *ai.AnthropicClient
+	aiClient   ai.ChatClient
+	rl         *readline.Instance
 	username   string
 	startedAt  time.Time
 	lastReview *lastReviewCtx
 	stats      sessionStats
+
+	// Project cache (populated async on session start)
+	projectCache []models.ProjectInfo
+	cacheMu      sync.RWMutex
+	cacheReady   chan struct{}
+
+	// Idle timeout
+	idleTimer *time.Timer
+	timedOut  atomic.Bool
 }
 
 type lastReviewCtx struct {
@@ -43,10 +57,171 @@ type sessionStats struct {
 	issuesViewed int
 }
 
+// ─── Auto-complete ───────────────────────────────────────────────────────────
+
+func (r *replState) buildCompleter() *readline.PrefixCompleter {
+	projectDynamic := readline.PcItemDynamic(func(line string) []string {
+		return r.projectSuggestions()
+	})
+
+	return readline.NewPrefixCompleter(
+		readline.PcItem("start"),
+		readline.PcItem("list"),
+		readline.PcItem("index",
+			projectDynamic,
+		),
+		readline.PcItem("mr",
+			readline.PcItem("-p", projectDynamic),
+		),
+		readline.PcItem("add",
+			readline.PcItem("comment"),
+		),
+		readline.PcItem("tickets",
+			readline.PcItem("-p", projectDynamic),
+		),
+		readline.PcItem("exit"),
+	)
+}
+
+// projectSuggestions returns cached project paths + names for auto-complete (thread-safe).
+func (r *replState) projectSuggestions() []string {
+	r.cacheMu.RLock()
+	defer r.cacheMu.RUnlock()
+
+	seen := make(map[string]bool, len(r.projectCache)*2)
+	suggestions := make([]string, 0, len(r.projectCache)*2)
+
+	// Paths first (full qualified)
+	for _, p := range r.projectCache {
+		if !seen[p.Path] {
+			suggestions = append(suggestions, p.Path)
+			seen[p.Path] = true
+		}
+	}
+	// Then short names (for convenience)
+	for _, p := range r.projectCache {
+		if !seen[p.Name] {
+			suggestions = append(suggestions, p.Name)
+			seen[p.Name] = true
+		}
+	}
+	return suggestions
+}
+
+// waitForCache waits for the project cache to be ready (up to 5s) and returns it.
+func (r *replState) waitForCache() []models.ProjectInfo {
+	if r.cacheReady != nil {
+		select {
+		case <-r.cacheReady:
+		case <-time.After(5 * time.Second):
+		}
+	}
+	r.cacheMu.RLock()
+	defer r.cacheMu.RUnlock()
+	result := make([]models.ProjectInfo, len(r.projectCache))
+	copy(result, r.projectCache)
+	return result
+}
+
+// fetchProjectCache fetches projects and stores them in the cache.
+func (r *replState) fetchProjectCache() {
+	if r.cacheReady != nil {
+		defer close(r.cacheReady)
+	}
+	projects, err := r.glClient.ListProjects()
+	if err != nil {
+		return // silently — cache stays empty
+	}
+	r.cacheMu.Lock()
+	r.projectCache = projects
+	r.cacheMu.Unlock()
+}
+
+// resolveProject resolves user input to a project path.
+// Priority: exact path match → case-insensitive path match →
+// exact name match → case-insensitive name match → return input as-is.
+func (r *replState) resolveProject(input string) string {
+	cache := r.waitForCache()
+	if len(cache) == 0 {
+		return input // no cache, let the API handle it
+	}
+
+	lower := strings.ToLower(input)
+
+	// 1. Exact path match
+	for _, p := range cache {
+		if p.Path == input {
+			return p.Path
+		}
+	}
+
+	// 2. Case-insensitive path match
+	for _, p := range cache {
+		if strings.ToLower(p.Path) == lower {
+			return p.Path
+		}
+	}
+
+	// 3. Exact name match → return path
+	for _, p := range cache {
+		if p.Name == input {
+			output.PrintSuccess(fmt.Sprintf("Resolved '%s' → %s", input, p.Path))
+			return p.Path
+		}
+	}
+
+	// 4. Case-insensitive name match → return path
+	for _, p := range cache {
+		if strings.ToLower(p.Name) == lower {
+			output.PrintSuccess(fmt.Sprintf("Resolved '%s' → %s", input, p.Path))
+			return p.Path
+		}
+	}
+
+	// 5. Partial path suffix match (e.g. "mgmt-srv" matches "cnips/mgmt-srv")
+	for _, p := range cache {
+		if strings.HasSuffix(strings.ToLower(p.Path), "/"+lower) {
+			output.PrintSuccess(fmt.Sprintf("Resolved '%s' → %s", input, p.Path))
+			return p.Path
+		}
+	}
+
+	// Not found in cache — return as-is, let the API try
+	return input
+}
+
+// resetIdle resets the idle timeout timer.
+func (r *replState) resetIdle() {
+	if !r.timedOut.Load() && r.idleTimer != nil {
+		r.idleTimer.Reset(5 * time.Minute)
+	}
+}
+
+// ─── REPL Entry Point ───────────────────────────────────────────────────────
+
 // RunREPL starts the interactive chatbot session.
 func RunREPL(cfg *config.AppConfig) {
 	r := &replState{cfg: cfg}
 
+	completer := r.buildCompleter()
+
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:            "gitlab-ai> ",
+		AutoComplete:      completer,
+		InterruptPrompt:   "^C",
+		EOFPrompt:         "exit",
+		HistoryFile:       "/tmp/gitlab-ai-history.tmp",
+		HistoryLimit:      500,
+		HistorySearchFold: true, // case-insensitive prefix search on ↑/↓
+	})
+	if err != nil {
+		fmt.Printf("Failed to initialize: %v\n", err)
+		return
+	}
+	defer rl.Close()
+	r.rl = rl
+
+	// Welcome banner
 	cyan := color.New(color.FgCyan, color.Bold)
 	bold := color.New(color.Bold)
 
@@ -54,49 +229,63 @@ func RunREPL(cfg *config.AppConfig) {
 	cyan.Println("🤖 gitlab-ai — Interactive Mode")
 	fmt.Println()
 	bold.Println("Commands:")
-	fmt.Println("  start                    Start GitLab session")
-	fmt.Println("  mr <number> -p <project> Review MR with AI")
-	fmt.Println("  add comment <number>     Post review as MR comment")
-	fmt.Println("  tickets -p <project>     List project issues & save")
-	fmt.Println("  exit                     End session")
+	fmt.Println("  start                        Start GitLab session")
+	fmt.Println("  list                         List accessible projects")
+	fmt.Println("  index <project> <path>       Index local code for context")
+	fmt.Println("  mr <number> <project_name>   Review MR with AI (uses context)")
+	fmt.Println("  add comment <number>         Post review as MR comment")
+	fmt.Println("  tickets <project_name>       List project issues & save")
+	fmt.Println("  exit                         End session")
 	fmt.Println()
-	fmt.Println("  Any other input is sent to Claude AI as a question.")
+	providerLabel := cfg.AI.Provider
+	if providerLabel == "" {
+		providerLabel = "anthropic"
+	}
+	fmt.Printf("  Any other input is sent to %s AI as a question.\n", providerLabel)
 	fmt.Println()
-	color.New(color.FgYellow).Println("Auto-exit after 1 minute of inactivity.")
+	color.New(color.FgYellow).Println("Auto-exit after 5 minutes of inactivity.")
+	fmt.Println()
+	dim := color.New(color.Faint)
+	dim.Println("Shortcuts: Tab = auto-complete | ↑/↓ = history | ←/→ = move cursor | Ctrl+R = search history")
 	fmt.Println()
 
-	inputCh := make(chan string)
-	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			inputCh <- scanner.Text()
-		}
-		close(inputCh)
-	}()
+	// Idle timeout — fires once, closes readline
+	r.idleTimer = time.AfterFunc(5*time.Minute, func() {
+		r.timedOut.Store(true)
+		rl.Close()
+	})
+	defer r.idleTimer.Stop()
 
-	timeout := time.NewTimer(1 * time.Minute)
-	defer timeout.Stop()
-
+	// Main read loop
 	for {
-		fmt.Print("gitlab-ai> ")
-		timeout.Reset(1 * time.Minute)
+		line, err := rl.Readline()
 
-		select {
-		case line, ok := <-inputCh:
-			if !ok {
-				r.handleExit()
-				return
-			}
-			line = strings.TrimSpace(line)
-			if line == "" {
+		// Check timeout first
+		if r.timedOut.Load() {
+			fmt.Println("\n⏰ Session timed out (5 minutes of inactivity)")
+			r.handleExit()
+			return
+		}
+
+		if err != nil {
+			if err == readline.ErrInterrupt {
+				r.resetIdle()
 				continue
 			}
-			if r.dispatch(line) {
-				return
-			}
-		case <-timeout.C:
-			fmt.Println("\n⏰ Session timed out (1 minute of inactivity)")
+			// io.EOF or readline closed
 			r.handleExit()
+			return
+		}
+
+		r.resetIdle()
+
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		if r.dispatch(line) {
+			r.idleTimer.Stop()
 			return
 		}
 	}
@@ -113,6 +302,10 @@ func (r *replState) dispatch(line string) bool {
 	switch cmd {
 	case "start":
 		r.handleStart()
+	case "list":
+		r.handleList()
+	case "index":
+		r.handleIndex(parts[1:])
 	case "mr":
 		r.handleMR(parts[1:])
 	case "add":
@@ -135,11 +328,13 @@ func (r *replState) dispatch(line string) bool {
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
-func (r *replState) handleStart() {
+// ensureSession auto-starts a GitLab session if one isn't active.
+func (r *replState) ensureSession() bool {
 	if r.glClient != nil {
-		output.PrintWarning("Session already active. Use 'exit' to end current session.")
-		return
+		return true
 	}
+
+	output.PrintWarning("No active session — auto-starting...")
 
 	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
 	s.Suffix = " Authenticating with GitLab..."
@@ -150,7 +345,7 @@ func (r *replState) handleStart() {
 
 	if err != nil {
 		output.PrintError(fmt.Sprintf("Authentication failed: %v", err))
-		return
+		return false
 	}
 
 	r.glClient = client
@@ -163,29 +358,186 @@ func (r *replState) handleStart() {
 	output.PrintSuccess(fmt.Sprintf("GitLab: %s", r.cfg.GitLab.BaseURL))
 	output.PrintSuccess("Session started — ready for commands")
 	fmt.Println()
+
+	// Async fetch projects for cache & auto-complete
+	r.cacheReady = make(chan struct{})
+	go r.fetchProjectCache()
+
+	return true
+}
+
+func (r *replState) handleStart() {
+	if r.glClient != nil {
+		output.PrintWarning("Session already active. Use 'exit' to end current session.")
+		return
+	}
+	r.ensureSession()
+}
+
+func (r *replState) handleList() {
+	if !r.ensureSession() {
+		return
+	}
+
+	// Use cached projects if available, otherwise fetch
+	projects := r.waitForCache()
+	if len(projects) == 0 {
+		s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
+		s.Suffix = " Fetching projects..."
+		s.Start()
+
+		var err error
+		projects, err = r.glClient.ListProjects()
+		s.Stop()
+
+		if err != nil {
+			output.PrintError(fmt.Sprintf("Failed to list projects: %v", err))
+			return
+		}
+	}
+
+	output.PrintProjectsTable(projects)
+	fmt.Println()
+}
+
+func (r *replState) handleIndex(args []string) {
+	var project, localPath string
+
+	// Parse: index <project> <local_path>
+	if len(args) >= 2 {
+		project = args[0]
+		localPath = strings.Join(args[1:], " ")
+	} else if len(args) == 1 {
+		project = args[0]
+	}
+
+	// Resolve project name if we have a session
+	if project != "" && r.glClient != nil {
+		project = r.resolveProject(project)
+	}
+
+	// Prompt for missing args
+	if project == "" {
+		project = r.promptForProject("Select project to index")
+		if project == "" {
+			output.PrintError("No project selected.")
+			return
+		}
+		if r.glClient != nil {
+			project = r.resolveProject(project)
+		}
+	}
+
+	if localPath == "" {
+		fmt.Println()
+		color.New(color.FgCyan, color.Bold).Println("Local Code Path")
+		fmt.Println("  Enter the absolute path to the project source code:")
+
+		r.rl.SetPrompt("path> ")
+		line, err := r.rl.Readline()
+		r.rl.SetPrompt("gitlab-ai> ")
+		r.resetIdle()
+		if err != nil {
+			return
+		}
+		localPath = strings.TrimSpace(line)
+		if localPath == "" {
+			output.PrintError("No path provided.")
+			return
+		}
+	}
+
+	// Expand ~ if present
+	if strings.HasPrefix(localPath, "~/") {
+		home, _ := os.UserHomeDir()
+		localPath = filepath.Join(home, localPath[2:])
+	}
+
+	// Index the directory
+	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
+	s.Suffix = fmt.Sprintf(" Indexing %s...", localPath)
+	s.Start()
+
+	indexContent, err := projectctx.IndexDirectory(localPath)
+	s.Stop()
+
+	if err != nil {
+		output.PrintError(fmt.Sprintf("Failed to index: %v", err))
+		return
+	}
+
+	// Save to context file
+	if err := projectctx.SaveIndex(project, indexContent); err != nil {
+		output.PrintError(fmt.Sprintf("Failed to save context: %v", err))
+		return
+	}
+
+	ctxPath := projectctx.ContextPath(project)
+	fi, _ := os.Stat(ctxPath)
+	sizeKB := float64(0)
+	if fi != nil {
+		sizeKB = float64(fi.Size()) / 1024
+	}
+
+	output.PrintSuccess(fmt.Sprintf("Project indexed → %s (%.1f KB)", ctxPath, sizeKB))
+	fmt.Println("  This context will be used for AI reviews of this project.")
+	fmt.Println()
 }
 
 func (r *replState) handleMR(args []string) {
-	if r.glClient == nil {
-		output.PrintError("No active session. Run 'start' first.")
+	if !r.ensureSession() {
 		return
 	}
 
-	// Parse: 226 -p mgmt
+	// Parse: mr <number> <project_name>  OR  mr <number> -p <project>
 	project, remaining := parseProjectFlag(args)
+
+	// Collect MR number and project name from remaining positional args
+	var mrNumberStr string
 	if project == "" {
-		output.PrintError("Usage: mr <number> -p <project>")
-		return
-	}
-	if len(remaining) == 0 {
-		output.PrintError("Usage: mr <number> -p <project>")
-		return
+		// No -p flag — expect positional args: <number> <project_name>
+		for _, arg := range remaining {
+			if _, err := strconv.Atoi(arg); err == nil && mrNumberStr == "" {
+				mrNumberStr = arg
+			} else if project == "" {
+				project = arg
+			}
+		}
+	} else {
+		// -p was used — remaining should have the MR number
+		if len(remaining) > 0 {
+			mrNumberStr = remaining[0]
+		}
 	}
 
-	mrNumber, err := strconv.Atoi(remaining[0])
-	if err != nil {
-		output.PrintError(fmt.Sprintf("Invalid MR number: %s", remaining[0]))
-		return
+	// If no project, prompt interactively
+	if project == "" {
+		project = r.promptForProject("Select project for MR review")
+		if project == "" {
+			output.PrintError("No project selected.")
+			return
+		}
+	}
+
+	// Resolve project name → path
+	project = r.resolveProject(project)
+
+	// Parse MR number
+	var mrNumber int
+	if mrNumberStr != "" {
+		n, err := strconv.Atoi(mrNumberStr)
+		if err != nil {
+			output.PrintError(fmt.Sprintf("Invalid MR number: %s", mrNumberStr))
+			return
+		}
+		mrNumber = n
+	} else {
+		// Prompt for MR number
+		mrNumber = r.promptForNumber("MR number")
+		if mrNumber <= 0 {
+			output.PrintError("Invalid MR number.")
+			return
+		}
 	}
 
 	// Step 1: Fetch MR from GitLab
@@ -203,17 +555,27 @@ func (r *replState) handleMR(args []string) {
 
 	output.PrintMRInfo(mrInfo)
 
-	// Step 2: AI Review via Claude
+	// Step 2: Load project context (if indexed)
+	projContext, _ := projectctx.LoadContextTruncated(project, 60000) // ~60KB cap
+	if projContext != "" {
+		output.PrintSuccess("Project context loaded for AI review")
+	}
+
+	// Step 3: AI Review
 	if err := r.ensureAI(); err != nil {
 		output.PrintError(err.Error())
 		return
 	}
 
 	s = spinner.New(spinner.CharSets[14], 100*time.Millisecond)
-	s.Suffix = " Generating AI review via Claude..."
+	suffix := fmt.Sprintf(" Generating AI review via %s", r.aiClient.ProviderName())
+	if projContext != "" {
+		suffix += " (with project context)"
+	}
+	s.Suffix = suffix + "..."
 	s.Start()
 
-	reviewText, err := r.reviewWithAI(mrInfo)
+	reviewText, err := r.reviewWithAI(mrInfo, projContext)
 	s.Stop()
 
 	if err != nil {
@@ -258,6 +620,13 @@ func (r *replState) handleMR(args []string) {
 	}
 
 	output.PrintSuccess(fmt.Sprintf("Review saved to: %s", filename))
+
+	// Step 6: Update project context with this review
+	if err := projectctx.AppendMRReview(project, mrNumber, mrInfo.Title, reviewText); err != nil {
+		output.PrintWarning(fmt.Sprintf("Could not update project context: %v", err))
+	} else {
+		output.PrintSuccess("Project context updated with MR review")
+	}
 	fmt.Println()
 
 	// Store context for "add comment" command
@@ -272,8 +641,7 @@ func (r *replState) handleMR(args []string) {
 }
 
 func (r *replState) handleAddComment(args []string) {
-	if r.glClient == nil {
-		output.PrintError("No active session. Run 'start' first.")
+	if !r.ensureSession() {
 		return
 	}
 	if r.lastReview == nil {
@@ -309,16 +677,29 @@ func (r *replState) handleAddComment(args []string) {
 }
 
 func (r *replState) handleTickets(args []string) {
-	if r.glClient == nil {
-		output.PrintError("No active session. Run 'start' first.")
+	if !r.ensureSession() {
 		return
 	}
 
-	project, _ := parseProjectFlag(args)
-	if project == "" {
-		output.PrintError("Usage: tickets -p <project>")
-		return
+	// Parse: tickets <project_name>  OR  tickets -p <project>
+	project, remaining := parseProjectFlag(args)
+
+	// No -p flag — treat remaining args as project name
+	if project == "" && len(remaining) > 0 {
+		project = strings.Join(remaining, " ")
 	}
+
+	// If still no project, prompt interactively
+	if project == "" {
+		project = r.promptForProject("Select project for tickets")
+		if project == "" {
+			output.PrintError("No project selected.")
+			return
+		}
+	}
+
+	// Resolve project name → path
+	project = r.resolveProject(project)
 
 	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
 	s.Suffix = fmt.Sprintf(" Fetching tickets from '%s'...", project)
@@ -347,6 +728,14 @@ func (r *replState) handleTickets(args []string) {
 	}
 
 	output.PrintSuccess(fmt.Sprintf("Tickets saved to: %s", filename))
+
+	// Update project context with ticket data
+	ticketsSummary := buildTicketsSummaryForContext(result)
+	if err := projectctx.UpdateTickets(project, ticketsSummary); err != nil {
+		output.PrintWarning(fmt.Sprintf("Could not update project context: %v", err))
+	} else {
+		output.PrintSuccess("Project context updated with tickets")
+	}
 	fmt.Println()
 
 	r.stats.issuesViewed += result.TotalCount
@@ -392,32 +781,100 @@ func (r *replState) handleChat(input string) {
 	fmt.Println()
 }
 
-// ─── Claude AI Integration ───────────────────────────────────────────────────
+// ─── Interactive Prompts ─────────────────────────────────────────────────────
+
+// promptForProject asks for a project name (with tab auto-complete from cache).
+func (r *replState) promptForProject(title string) string {
+	fmt.Println()
+	color.New(color.FgCyan, color.Bold).Println(title)
+	fmt.Println("  Enter project name or path (Tab to auto-complete):")
+
+	r.rl.SetPrompt("project> ")
+	defer r.rl.SetPrompt("gitlab-ai> ")
+
+	line, err := r.rl.Readline()
+	r.resetIdle()
+
+	if err != nil {
+		return ""
+	}
+
+	input := strings.TrimSpace(line)
+	if input == "" {
+		return ""
+	}
+
+	return input
+}
+
+// promptForNumber asks the user for a number.
+func (r *replState) promptForNumber(label string) int {
+	r.rl.SetPrompt(fmt.Sprintf("%s> ", label))
+	defer r.rl.SetPrompt("gitlab-ai> ")
+
+	line, err := r.rl.Readline()
+	r.resetIdle()
+
+	if err != nil {
+		return 0
+	}
+
+	n, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// ─── AI Integration ──────────────────────────────────────────────────────────
 
 func (r *replState) ensureAI() error {
 	if r.aiClient != nil {
 		return nil
 	}
 
-	cfg := r.cfg.AI.Anthropic
+	provider := strings.ToLower(r.cfg.AI.Provider)
 
-	// Priority: direct api_key in config → env var
-	apiKey := cfg.APIKey
-	if apiKey == "" && cfg.APIKeyEnv != "" {
-		apiKey = os.Getenv(cfg.APIKeyEnv)
-	}
-	if apiKey == "" {
-		return fmt.Errorf("Anthropic API key not configured.\n  Set 'ai.anthropic.api_key' in ~/.gitlab-ai/config.yaml\n  Or export %s environment variable.\n  Get your key at: https://console.anthropic.com/settings/keys", cfg.APIKeyEnv)
+	switch provider {
+	case "anthropic", "claude", "":
+		cfg := r.cfg.AI.Anthropic
+		apiKey := cfg.APIKey
+		if apiKey == "" && cfg.APIKeyEnv != "" {
+			apiKey = os.Getenv(cfg.APIKeyEnv)
+		}
+		if apiKey == "" {
+			return fmt.Errorf("Anthropic API key not configured.\n  Set 'ai.anthropic.api_key' in config.yaml\n  Or export %s environment variable.\n  Get your key at: https://console.anthropic.com/settings/keys", cfg.APIKeyEnv)
+		}
+		r.aiClient = ai.NewAnthropicClient(apiKey, cfg.Model, cfg.MaxTokens)
+
+	case "gemini", "google":
+		cfg := r.cfg.AI.Gemini
+		apiKey := cfg.APIKey
+		if apiKey == "" && cfg.APIKeyEnv != "" {
+			apiKey = os.Getenv(cfg.APIKeyEnv)
+		}
+		if apiKey == "" {
+			return fmt.Errorf("Gemini API key not configured.\n  Set 'ai.gemini.api_key' in config.yaml\n  Or export %s environment variable.\n  Get your key at: https://aistudio.google.com/apikey", cfg.APIKeyEnv)
+		}
+		r.aiClient = ai.NewGeminiClient(apiKey, cfg.Model, cfg.MaxTokens)
+
+	default:
+		return fmt.Errorf("unknown AI provider: %q (supported: anthropic, gemini)", r.cfg.AI.Provider)
 	}
 
-	r.aiClient = ai.NewAnthropicClient(apiKey, cfg.Model, cfg.MaxTokens)
 	return nil
 }
 
-func (r *replState) reviewWithAI(mr *models.MergeRequestInfo) (string, error) {
+func (r *replState) reviewWithAI(mr *models.MergeRequestInfo, projectContext string) (string, error) {
 	ctx := context.Background()
 
 	systemPrompt := ai.BuildSystemPrompt()
+	if projectContext != "" {
+		systemPrompt += "\n\n## Project Context\n" +
+			"Use the following project knowledge (code structure, past reviews, tickets) " +
+			"to provide more accurate, context-aware reviews:\n\n" + projectContext
+	}
+
 	userPrompt := ai.BuildReviewPrompt(mr, r.cfg.Review.Template.Sections)
 
 	return r.aiClient.Chat(ctx, systemPrompt, userPrompt)
@@ -506,7 +963,7 @@ func buildReviewMarkdown(review *models.Review) string {
 		sb.WriteString("\n\n")
 	}
 
-	sb.WriteString("---\n\n*Generated by gitlab-ai CLI (Claude AI)*\n")
+	sb.WriteString("---\n\n*Generated by gitlab-ai CLI*\n")
 	return sb.String()
 }
 
@@ -545,5 +1002,32 @@ func buildTicketsMarkdown(result *models.IssueListResult) string {
 	}
 
 	sb.WriteString("*Generated by gitlab-ai CLI*\n")
+	return sb.String()
+}
+
+// buildTicketsSummaryForContext creates a compact summary of tickets for the context file.
+func buildTicketsSummaryForContext(result *models.IssueListResult) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("**%d open tickets**\n\n", result.TotalCount))
+
+	for _, issue := range result.Issues {
+		sb.WriteString(fmt.Sprintf("- **#%d** %s", issue.IID, issue.Title))
+		if issue.Assignee != "" {
+			sb.WriteString(fmt.Sprintf(" (@%s)", issue.Assignee))
+		}
+		if len(issue.Labels) > 0 {
+			sb.WriteString(fmt.Sprintf(" [%s]", strings.Join(issue.Labels, ", ")))
+		}
+		sb.WriteString("\n")
+		if issue.Description != "" {
+			// Include first 200 chars of description for context
+			desc := issue.Description
+			if len(desc) > 200 {
+				desc = desc[:200] + "..."
+			}
+			sb.WriteString(fmt.Sprintf("  > %s\n", strings.ReplaceAll(desc, "\n", " ")))
+		}
+	}
+
 	return sb.String()
 }

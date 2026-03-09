@@ -28,6 +28,15 @@ type GitLabConfig struct {
 type AIConfig struct {
 	Provider  string          `mapstructure:"provider" yaml:"provider"`
 	Anthropic AnthropicConfig `mapstructure:"anthropic" yaml:"anthropic"`
+	Gemini    GeminiConfig    `mapstructure:"gemini" yaml:"gemini"`
+}
+
+// GeminiConfig holds Google Gemini-specific settings.
+type GeminiConfig struct {
+	APIKey    string `mapstructure:"api_key" yaml:"api_key"`         // direct key (takes priority)
+	APIKeyEnv string `mapstructure:"api_key_env" yaml:"api_key_env"` // env var name fallback
+	Model     string `mapstructure:"model" yaml:"model"`
+	MaxTokens int    `mapstructure:"max_tokens" yaml:"max_tokens"`
 }
 
 // AnthropicConfig holds Anthropic-specific settings.

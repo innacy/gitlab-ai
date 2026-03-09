@@ -17,6 +17,12 @@ func setDefaults() {
 	viper.SetDefault("ai.anthropic.max_tokens", 8192)
 	viper.SetDefault("ai.anthropic.temperature", 0.7)
 
+	// Gemini defaults
+	viper.SetDefault("ai.gemini.api_key", "")
+	viper.SetDefault("ai.gemini.api_key_env", "GEMINI_API_KEY")
+	viper.SetDefault("ai.gemini.model", "gemini-2.5-flash")
+	viper.SetDefault("ai.gemini.max_tokens", 8192)
+
 	// Review defaults
 	viper.SetDefault("review.output.directory", "./reviews")
 	viper.SetDefault("review.output.filename_pattern", "{project}_{mr_number}.md")

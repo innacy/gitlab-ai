@@ -28,6 +28,9 @@ Thumbs.db
 !docs/*.md
 !configs/*.yaml
 
+# Local project context (indexed code, review history)
+.context/
+
 # Config with secrets (lives in ~/.gitlab-ai/)
 config.yaml
 !configs/default.yaml

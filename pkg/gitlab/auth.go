@@ -6,6 +6,7 @@ import (
 
 	gogitlab "github.com/xanzy/go-gitlab"
 
+	"gitlab-ai/internal/models"
 	"gitlab-ai/pkg/config"
 	"gitlab-ai/pkg/utils"
 )
@@ -66,4 +67,40 @@ func FindProject(client *gogitlab.Client, projectPath string) (*gogitlab.Project
 		return nil, utils.NewProjectNotFoundError(fmt.Sprintf("%s (API error: %v)", projectPath, err))
 	}
 	return project, nil
+}
+
+// ListProjects returns projects accessible by the authenticated user.
+func (c *Client) ListProjects() ([]models.ProjectInfo, error) {
+	membership := true
+	opts := &gogitlab.ListProjectsOptions{
+		Membership: &membership,
+		OrderBy:    gogitlab.Ptr("last_activity_at"),
+		Sort:       gogitlab.Ptr("desc"),
+		ListOptions: gogitlab.ListOptions{
+			PerPage: 50,
+		},
+	}
+
+	projects, _, err := c.api.Projects.ListProjects(opts)
+	if err != nil {
+		return nil, utils.NewGitLabError("failed to list projects", err)
+	}
+
+	result := make([]models.ProjectInfo, 0, len(projects))
+	for _, p := range projects {
+		info := models.ProjectInfo{
+			ID:            p.ID,
+			Name:          p.Name,
+			Path:          p.PathWithNamespace,
+			Description:   p.Description,
+			WebURL:        p.WebURL,
+			DefaultBranch: p.DefaultBranch,
+		}
+		if p.LastActivityAt != nil {
+			info.LastActivity = *p.LastActivityAt
+		}
+		result = append(result, info)
+	}
+
+	return result, nil
 }

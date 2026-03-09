@@ -101,6 +101,44 @@ func PrintIssuesTable(result *models.IssueListResult) {
 	fmt.Printf("\nTotal: %d issues\n", result.TotalCount)
 }
 
+// PrintProjectsTable displays a list of projects in a formatted table.
+func PrintProjectsTable(projects []models.ProjectInfo) {
+	fmt.Println()
+	headerColor := color.New(color.FgCyan, color.Bold)
+	headerColor.Println("Accessible Projects")
+	fmt.Println()
+
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"Path", "Name", "Branch", "Last Activity"})
+	table.SetBorders(tablewriter.Border{Left: true, Top: true, Right: true, Bottom: true})
+	table.SetCenterSeparator("┼")
+	table.SetColumnSeparator("│")
+	table.SetRowSeparator("─")
+	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
+	table.SetAlignment(tablewriter.ALIGN_LEFT)
+	table.SetColMinWidth(0, 25)
+	table.SetColWidth(50)
+
+	for _, p := range projects {
+		activity := timeAgo(p.LastActivity)
+
+		name := p.Name
+		if len(name) > 30 {
+			name = name[:27] + "..."
+		}
+
+		table.Append([]string{
+			p.Path,
+			name,
+			p.DefaultBranch,
+			activity,
+		})
+	}
+
+	table.Render()
+	fmt.Printf("\nTotal: %d projects\n", len(projects))
+}
+
 // Helper functions
 
 func timeAgo(t time.Time) string {

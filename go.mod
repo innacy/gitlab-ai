@@ -1,9 +1,10 @@
 module gitlab-ai
 
-go 1.24.6
+go 1.25.8
 
 require (
 	github.com/briandowns/spinner v1.23.0
+	github.com/chzyer/readline v1.5.1
 	github.com/fatih/color v1.16.0
 	github.com/olekukonko/tablewriter v0.0.5
 	github.com/rs/zerolog v1.32.0

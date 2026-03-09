@@ -1,6 +1,19 @@
 package models
 
-import "time"
+import (
+	"time"
+)
+
+// ProjectInfo represents a GitLab project summary.
+type ProjectInfo struct {
+	ID            int       `json:"id"`
+	Name          string    `json:"name"`
+	Path          string    `json:"path_with_namespace"`
+	Description   string    `json:"description"`
+	WebURL        string    `json:"web_url"`
+	DefaultBranch string    `json:"default_branch"`
+	LastActivity  time.Time `json:"last_activity_at"`
+}
 
 // Issue represents a GitLab issue with relevant fields.
 type Issue struct {

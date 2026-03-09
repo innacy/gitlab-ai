@@ -36,6 +36,9 @@ func NewAnthropicClient(apiKey, model string, maxTokens int) *AnthropicClient {
 	}
 }
 
+// ProviderName returns "Claude".
+func (c *AnthropicClient) ProviderName() string { return "Claude" }
+
 // ─── Request / Response types ────────────────────────────────────────────────
 
 type messagesRequest struct {

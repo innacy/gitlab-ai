@@ -1,31 +1,30 @@
-# GitLab AI CLI Configuration
-# See: gitlab-ai help config
+# GitLab AI CLI — Default Configuration (sample)
+# Copy relevant sections to config.yaml and fill in your values.
 
-# GitLab Configuration
+# GitLab connection
 gitlab:
-  base_url: "https://gitlab.widas.de/"
+  base_url: "https://gitlab.example.com/"
   api_version: "v4"
-  default_project: ""
+  # default_project: "group/my-project"
 
-# AI Provider Configuration
-# Supported providers: "anthropic", "gemini"
+# AI provider: "anthropic" or "gemini"
 ai:
-  provider: "anthropic" # Switch to "gemini" to use Google Gemini
+  provider: "anthropic"
 
   anthropic:
-    api_key: "" # Put your key here, or use api_key_env
-    api_key_env: "ANTHROPIC_API_KEY" # Env var fallback
+    api_key: ""            # or set ANTHROPIC_API_KEY env var
+    # api_key_env: "ANTHROPIC_API_KEY"
     model: "claude-sonnet-4-20250514"
     max_tokens: 8192
     temperature: 0.7
 
   gemini:
-    api_key: "" # Put your key here, or use api_key_env
-    api_key_env: "GEMINI_API_KEY" # Env var fallback
+    api_key: ""            # or set GEMINI_API_KEY env var
+    # api_key_env: "GEMINI_API_KEY"
     model: "gemini-2.5-flash"
     max_tokens: 8192
 
-# Review Configuration
+# Review template sections used by mr-review
 review:
   template:
     sections:
@@ -41,9 +40,6 @@ review:
       - name: "Performance Impact"
         prompt: "Evaluate potential performance implications"
         required: false
-      - name: "Testing Coverage"
-        prompt: "Comment on test coverage and quality"
-        required: true
       - name: "Suggestions"
         prompt: "Provide actionable improvement suggestions"
         required: true
@@ -63,7 +59,7 @@ review:
       - "vendor/*"
       - "*.generated.go"
 
-# Issue Configuration
+# Issue / ticket output settings
 issues:
   output:
     directory: "./issues"
@@ -81,7 +77,21 @@ issues:
     - "milestone"
     - "web_url"
 
-# CLI Configuration
+# Teams — GitLab group prefixes to scope the session
+# teams:
+#   - "my-team"
+
+# Projects — pre-configured project paths for ticket-open
+# One entry = auto-selected, multiple = prompted to choose
+# projects:
+#   - "my-team/backend"
+#   - "my-team/frontend"
+
+# Ignored projects — excluded from tickets / tickets-black reports
+# ignored_projects:
+#   - "my-team/testcase"
+
+# CLI behaviour
 cli:
   color_output: true
   markdown_rendering: true

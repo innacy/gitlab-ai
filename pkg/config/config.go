@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/spf13/viper"
 
@@ -10,11 +11,17 @@ import (
 
 // AppConfig holds the complete application configuration.
 type AppConfig struct {
-	GitLab GitLabConfig `mapstructure:"gitlab" yaml:"gitlab"`
-	AI     AIConfig     `mapstructure:"ai" yaml:"ai"`
-	Review ReviewConfig `mapstructure:"review" yaml:"review"`
-	Issues IssuesConfig `mapstructure:"issues" yaml:"issues"`
-	CLI    CLIConfig    `mapstructure:"cli" yaml:"cli"`
+	GitLab          GitLabConfig `mapstructure:"gitlab" yaml:"gitlab"`
+	AI              AIConfig     `mapstructure:"ai" yaml:"ai"`
+	Review          ReviewConfig `mapstructure:"review" yaml:"review"`
+	Issues          IssuesConfig `mapstructure:"issues" yaml:"issues"`
+	CLI             CLIConfig             `mapstructure:"cli" yaml:"cli"`
+	Other           OtherOutputConfig     `mapstructure:"other" yaml:"other"`
+	TicketContent   ContentTemplateConfig `mapstructure:"ticket_content" yaml:"ticket_content"`
+	EpicContent     ContentTemplateConfig `mapstructure:"epic_content" yaml:"epic_content"`
+	Teams           []string              `mapstructure:"teams" yaml:"teams"`
+	Projects        []string              `mapstructure:"projects" yaml:"projects"`
+	IgnoredProjects []string              `mapstructure:"ignored_projects" yaml:"ignored_projects"`
 }
 
 // GitLabConfig holds GitLab connection settings.
@@ -41,8 +48,8 @@ type GeminiConfig struct {
 
 // AnthropicConfig holds Anthropic-specific settings.
 type AnthropicConfig struct {
-	APIKey      string  `mapstructure:"api_key" yaml:"api_key"`           // direct key (takes priority)
-	APIKeyEnv   string  `mapstructure:"api_key_env" yaml:"api_key_env"`   // env var name fallback
+	APIKey      string  `mapstructure:"api_key" yaml:"api_key"`         // direct key (takes priority)
+	APIKeyEnv   string  `mapstructure:"api_key_env" yaml:"api_key_env"` // env var name fallback
 	Model       string  `mapstructure:"model" yaml:"model"`
 	MaxTokens   int     `mapstructure:"max_tokens" yaml:"max_tokens"`
 	Temperature float64 `mapstructure:"temperature" yaml:"temperature"`
@@ -85,6 +92,16 @@ type IssuesOutputConfig struct {
 	FilenamePattern string `mapstructure:"filename_pattern" yaml:"filename_pattern"`
 }
 
+// OtherOutputConfig holds output settings for non-review, non-issue markdown files.
+type OtherOutputConfig struct {
+	Directory string `mapstructure:"directory" yaml:"directory"`
+}
+
+// ContentTemplateConfig holds a markdown template for AI-generated content.
+type ContentTemplateConfig struct {
+	Template string `mapstructure:"template" yaml:"template"`
+}
+
 // CLIConfig holds CLI behavior settings.
 type CLIConfig struct {
 	ColorOutput       bool `mapstructure:"color_output" yaml:"color_output"`
@@ -97,8 +114,8 @@ type CLIConfig struct {
 func Load() (*AppConfig, error) {
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
-	viper.AddConfigPath(".")          // project directory (primary)
-	viper.AddConfigPath("./configs")  // configs subdirectory
+	viper.AddConfigPath(".")         // project directory (primary)
+	viper.AddConfigPath("./configs") // configs subdirectory
 
 	// Set defaults
 	setDefaults()
@@ -119,6 +136,27 @@ func Load() (*AppConfig, error) {
 		return nil, fmt.Errorf("failed to parse configuration: %w", err)
 	}
 
+	if err := cfg.EnsureOutputDirs(); err != nil {
+		return nil, fmt.Errorf("failed to create output directories: %w", err)
+	}
+
 	return cfg, nil
 }
 
+// EnsureOutputDirs creates all configured output directories if they don't exist.
+func (c *AppConfig) EnsureOutputDirs() error {
+	dirs := []string{
+		c.Review.Output.Directory,
+		c.Issues.Output.Directory,
+		c.Other.Directory,
+	}
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("cannot create directory %q: %w", dir, err)
+		}
+	}
+	return nil
+}

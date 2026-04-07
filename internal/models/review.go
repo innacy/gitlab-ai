@@ -68,3 +68,15 @@ type ReviewTemplateSection struct {
 	Prompt   string `yaml:"prompt" json:"prompt"`
 	Required bool   `yaml:"required" json:"required"`
 }
+
+// MRListItem represents a merge request in list views.
+type MRListItem struct {
+	IID          int       `json:"iid"`
+	Title        string    `json:"title"`
+	State        string    `json:"state"`
+	Author       string    `json:"author"`
+	SourceBranch string    `json:"source_branch"`
+	TargetBranch string    `json:"target_branch"`
+	WebURL       string    `json:"web_url"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}

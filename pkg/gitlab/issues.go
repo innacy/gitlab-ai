@@ -2,6 +2,7 @@ package gitlab
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	gogitlab "github.com/xanzy/go-gitlab"
@@ -12,17 +13,28 @@ import (
 
 // ListAssignedIssues fetches issues assigned to the current user.
 func (c *Client) ListAssignedIssues(projectPath string, filter models.IssueFilter) (*models.IssueListResult, error) {
+	return c.listProjectIssues(projectPath, filter, true)
+}
+
+// ListProjectIssues fetches all project issues using the provided filter.
+func (c *Client) ListProjectIssues(projectPath string, filter models.IssueFilter) (*models.IssueListResult, error) {
+	return c.listProjectIssues(projectPath, filter, false)
+}
+
+func (c *Client) listProjectIssues(projectPath string, filter models.IssueFilter, assignedOnly bool) (*models.IssueListResult, error) {
 	project, err := FindProject(c.api, projectPath)
 	if err != nil {
 		return nil, err
 	}
 
 	opts := &gogitlab.ListProjectIssuesOptions{
-		AssigneeID: gogitlab.AssigneeID(c.user.ID),
 		ListOptions: gogitlab.ListOptions{
 			PerPage: 50,
 			Page:    1,
 		},
+	}
+	if assignedOnly {
+		opts.AssigneeID = gogitlab.AssigneeID(c.user.ID)
 	}
 
 	// Apply filters
@@ -66,6 +78,66 @@ func (c *Client) ListAssignedIssues(projectPath string, filter models.IssueFilte
 		TotalCount:  len(allIssues),
 		GeneratedAt: time.Now(),
 	}, nil
+}
+
+// ListProjectLabels returns available labels for a project.
+func (c *Client) ListProjectLabels(projectPath string) ([]string, error) {
+	project, err := FindProject(c.api, projectPath)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := &gogitlab.ListLabelsOptions{
+		ListOptions: gogitlab.ListOptions{
+			PerPage: 100,
+			Page:    1,
+		},
+	}
+
+	labels := make([]string, 0, 100)
+	for {
+		items, resp, err := c.api.Labels.ListLabels(project.ID, opts)
+		if err != nil {
+			return nil, utils.NewGitLabError(fmt.Sprintf("failed to list labels for project '%s'", projectPath), err)
+		}
+		for _, label := range items {
+			name := strings.TrimSpace(label.Name)
+			if name != "" {
+				labels = append(labels, name)
+			}
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	return labels, nil
+}
+
+// CreateIssue creates a new issue in the target project.
+func (c *Client) CreateIssue(projectPath, title, description string, labels []string) (*models.Issue, error) {
+	project, err := FindProject(c.api, projectPath)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := &gogitlab.CreateIssueOptions{
+		Title:       gogitlab.Ptr(title),
+		Description: gogitlab.Ptr(description),
+	}
+	if len(labels) > 0 {
+		labelOptions := gogitlab.LabelOptions(labels)
+		opts.Labels = &labelOptions
+	}
+
+	issue, _, err := c.api.Issues.CreateIssue(project.ID, opts)
+	if err != nil {
+		return nil, utils.NewGitLabError(fmt.Sprintf("failed to create issue for project '%s'", projectPath), err)
+	}
+
+	converted := convertIssue(issue)
+	return &converted, nil
 }
 
 // convertIssue converts a go-gitlab Issue to our models.Issue.

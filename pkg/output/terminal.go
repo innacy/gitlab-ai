@@ -80,7 +80,7 @@ func PrintIssuesTable(result *models.IssueListResult) {
 
 	for _, issue := range result.Issues {
 		labels := strings.Join(issue.Labels, ", ")
-		updated := timeAgo(issue.UpdatedAt)
+		updated := TimeAgo(issue.UpdatedAt)
 
 		// Truncate title if too long
 		title := issue.Title
@@ -120,7 +120,7 @@ func PrintProjectsTable(projects []models.ProjectInfo) {
 	table.SetColWidth(50)
 
 	for _, p := range projects {
-		activity := timeAgo(p.LastActivity)
+		activity := TimeAgo(p.LastActivity)
 
 		name := p.Name
 		if len(name) > 30 {
@@ -139,9 +139,227 @@ func PrintProjectsTable(projects []models.ProjectInfo) {
 	fmt.Printf("\nTotal: %d projects\n", len(projects))
 }
 
+// PrintMRListTable displays merge requests in a table.
+func PrintMRListTable(mrs []models.MRListItem, title string) {
+	fmt.Println()
+	headerColor := color.New(color.FgCyan, color.Bold)
+	headerColor.Println(title)
+	fmt.Println()
+
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"#", "Title", "Author", "Branch", "Updated"})
+	table.SetBorders(tablewriter.Border{Left: true, Top: true, Right: true, Bottom: true})
+	table.SetCenterSeparator("┼")
+	table.SetColumnSeparator("│")
+	table.SetRowSeparator("─")
+	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
+	table.SetAlignment(tablewriter.ALIGN_LEFT)
+	table.SetColMinWidth(1, 30)
+	table.SetColWidth(50)
+
+	for _, mr := range mrs {
+		title := mr.Title
+		if len(title) > 45 {
+			title = title[:42] + "..."
+		}
+		branch := fmt.Sprintf("%s → %s", mr.SourceBranch, mr.TargetBranch)
+		if len(branch) > 35 {
+			branch = branch[:32] + "..."
+		}
+		table.Append([]string{
+			fmt.Sprintf("%d", mr.IID),
+			title,
+			mr.Author,
+			branch,
+			TimeAgo(mr.UpdatedAt),
+		})
+	}
+
+	table.Render()
+	fmt.Printf("\nTotal: %d merge requests\n", len(mrs))
+}
+
+// PrintBranchesTable displays branches in a formatted table.
+func PrintBranchesTable(branches []models.BranchInfo, title string) {
+	fmt.Println()
+	headerColor := color.New(color.FgCyan, color.Bold)
+	headerColor.Println(title)
+	fmt.Println()
+
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"#", "Branch", "Last Commit", "Author", "Age", "Status"})
+	table.SetBorders(tablewriter.Border{Left: true, Top: true, Right: true, Bottom: true})
+	table.SetCenterSeparator("┼")
+	table.SetColumnSeparator("│")
+	table.SetRowSeparator("─")
+	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
+	table.SetAlignment(tablewriter.ALIGN_LEFT)
+	table.SetColMinWidth(1, 25)
+	table.SetColWidth(50)
+
+	for i, b := range branches {
+		commit := b.CommitTitle
+		if len(commit) > 40 {
+			commit = commit[:37] + "..."
+		}
+		status := ""
+		if b.Merged {
+			status = "merged"
+		}
+		if b.Protected {
+			status = "protected"
+		}
+		table.Append([]string{
+			fmt.Sprintf("%d", i+1),
+			b.Name,
+			commit,
+			b.AuthorName,
+			TimeAgo(b.CommitDate),
+			status,
+		})
+	}
+
+	table.Render()
+}
+
+// PrintPipelineStatus displays CI/CD pipeline status with jobs.
+func PrintPipelineStatus(pipeline *models.PipelineInfo) {
+	fmt.Println()
+	headerColor := color.New(color.FgCyan, color.Bold)
+	headerColor.Printf("Pipeline #%d — %s\n", pipeline.ID, pipeline.Ref)
+
+	statusColor := color.New(color.FgRed, color.Bold)
+	switch pipeline.Status {
+	case "success":
+		statusColor = color.New(color.FgGreen, color.Bold)
+	case "running", "pending":
+		statusColor = color.New(color.FgYellow, color.Bold)
+	case "canceled", "skipped":
+		statusColor = color.New(color.FgHiBlack)
+	}
+	statusColor.Printf("Status: %s\n", strings.ToUpper(pipeline.Status))
+
+	if pipeline.WebURL != "" {
+		fmt.Printf("URL: %s\n", pipeline.WebURL)
+	}
+	fmt.Println()
+
+	if len(pipeline.Jobs) > 0 {
+		table := tablewriter.NewWriter(os.Stdout)
+		table.SetHeader([]string{"Stage", "Job", "Status"})
+		table.SetBorders(tablewriter.Border{Left: true, Top: true, Right: true, Bottom: true})
+		table.SetCenterSeparator("┼")
+		table.SetColumnSeparator("│")
+		table.SetRowSeparator("─")
+		table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
+		table.SetAlignment(tablewriter.ALIGN_LEFT)
+
+		for _, job := range pipeline.Jobs {
+			icon := "⬜"
+			switch job.Status {
+			case "success":
+				icon = "✅"
+			case "failed":
+				icon = "❌"
+			case "running":
+				icon = "🔄"
+			case "pending":
+				icon = "⏳"
+			case "canceled":
+				icon = "🚫"
+			case "skipped":
+				icon = "⏭️"
+			}
+			table.Append([]string{
+				job.Stage,
+				job.Name,
+				fmt.Sprintf("%s %s", icon, job.Status),
+			})
+		}
+		table.Render()
+	}
+	fmt.Println()
+}
+
+// PrintReleaseReport displays the release status of all projects.
+func PrintReleaseReport(report *models.ReleaseReport) {
+	fmt.Println()
+	headerColor := color.New(color.FgCyan, color.Bold)
+	headerColor.Println("Release Status Report")
+	headerColor.Printf("Generated: %s\n", report.GeneratedAt.Format("2006-01-02 15:04"))
+	fmt.Println()
+
+	maxLen := 0
+	for _, p := range report.Pending {
+		if len(p.Name) > maxLen {
+			maxLen = len(p.Name)
+		}
+	}
+	for _, p := range report.Released {
+		if len(p.Name) > maxLen {
+			maxLen = len(p.Name)
+		}
+	}
+	for _, p := range report.Invalid {
+		if len(p.Name) > maxLen {
+			maxLen = len(p.Name)
+		}
+	}
+	if maxLen < 20 {
+		maxLen = 20
+	}
+
+	pendingStyle := color.New(color.FgYellow, color.Bold)
+	releasedStyle := color.New(color.FgGreen)
+	invalidStyle := color.New(color.FgHiBlack)
+	sectionTitle := color.New(color.Bold)
+	dim := color.New(color.Faint)
+
+	if len(report.Pending) > 0 {
+		sectionTitle.Printf("  Pending Master Merge (%d)\n", len(report.Pending))
+		for _, p := range report.Pending {
+			padded := fmt.Sprintf("%-*s", maxLen, p.Name)
+			pendingStyle.Printf("    %s", padded)
+			fmt.Printf(" - ***Pending Master Merge - %s", p.LatestTag)
+			extra := fmt.Sprintf("  (%d commits ahead", p.CommitsAhead)
+			if !p.LastDevCommitDate.IsZero() {
+				extra += fmt.Sprintf(", last: %s", p.LastDevCommitDate.Format("2006-01-02"))
+			}
+			extra += ")"
+			dim.Printf("%s\n", extra)
+		}
+		fmt.Println()
+	}
+
+	if len(report.Released) > 0 {
+		sectionTitle.Printf("  Merged To Master (%d)\n", len(report.Released))
+		for _, p := range report.Released {
+			padded := fmt.Sprintf("%-*s", maxLen, p.Name)
+			releasedStyle.Printf("    %s", padded)
+			fmt.Printf(" - Merged To Master - %s\n", p.LatestTag)
+		}
+		fmt.Println()
+	}
+
+	if len(report.Invalid) > 0 {
+		sectionTitle.Printf("  Invalid Projects (%d)\n", len(report.Invalid))
+		for _, p := range report.Invalid {
+			padded := fmt.Sprintf("%-*s", maxLen, p.Name)
+			invalidStyle.Printf("    %s", padded)
+			fmt.Printf(" - %s %s\n", warningIcon, p.InvalidReason)
+		}
+		fmt.Println()
+	}
+
+	total := len(report.Pending) + len(report.Released) + len(report.Invalid)
+	fmt.Printf("  Total: %d projects checked\n", total)
+	fmt.Println()
+}
+
 // Helper functions
 
-func timeAgo(t time.Time) string {
+// TimeAgo returns a human-readable relative time string.
+func TimeAgo(t time.Time) string {
 	duration := time.Since(t)
 	switch {
 	case duration < time.Minute:

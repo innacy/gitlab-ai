@@ -60,6 +60,132 @@ func BuildReviewPrompt(mr *models.MergeRequestInfo, sections []models.ReviewTemp
 	return sb.String()
 }
 
+// BuildMRDescriptionPrompt constructs a prompt to generate a merge request description.
+func BuildMRDescriptionPrompt(sourceBranch, targetBranch string, commitMessages []string) string {
+	var sb strings.Builder
+	sb.WriteString("Generate a concise merge request description based on the following commits.\n\n")
+	sb.WriteString(fmt.Sprintf("Source branch: %s\nTarget branch: %s\n\n", sourceBranch, targetBranch))
+	sb.WriteString("Commits:\n")
+	for _, msg := range commitMessages {
+		sb.WriteString(fmt.Sprintf("- %s\n", msg))
+	}
+	sb.WriteString("\nWrite a clear, professional MR description that:\n")
+	sb.WriteString("1. Summarizes what changes are being made\n")
+	sb.WriteString("2. Explains the purpose/motivation\n")
+	sb.WriteString("3. Lists key changes as bullet points\n")
+	sb.WriteString("\nOutput only the description text, no additional formatting or headings.\n")
+	return sb.String()
+}
+
+// BuildTicketContentPrompt constructs a prompt for generating concise ticket content from a branch diff.
+func BuildTicketContentPrompt(diff *models.DiffResult, template string) string {
+	var sb strings.Builder
+
+	sb.WriteString("Generate a concise GitLab ticket (issue) based on the code changes below.\n")
+	sb.WriteString("Be precise with no extra detail. Keep it short and actionable.\n\n")
+
+	sb.WriteString("## Branch Comparison\n")
+	sb.WriteString(fmt.Sprintf("- **Base branch:** %s\n", diff.From))
+	sb.WriteString(fmt.Sprintf("- **Feature branch:** %s\n", diff.To))
+	sb.WriteString(fmt.Sprintf("- **Files changed:** %d (+%d -%d lines)\n\n", len(diff.Files), diff.TotalAdditions, diff.TotalDeletions))
+
+	if len(diff.Commits) > 0 {
+		sb.WriteString("## Commits\n")
+		for _, msg := range diff.Commits {
+			sb.WriteString(fmt.Sprintf("- %s\n", msg))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("## Changed Files\n")
+	for _, f := range diff.Files {
+		status := "modified"
+		if f.NewFile {
+			status = "added"
+		} else if f.Deleted {
+			status = "deleted"
+		} else if f.Renamed {
+			status = "renamed"
+		}
+		sb.WriteString(fmt.Sprintf("- `%s` (%s, +%d -%d)\n", f.NewPath, status, f.Additions, f.Deletions))
+	}
+	sb.WriteString("\n")
+
+	diffContent := diff.DiffContent
+	const maxDiffSize = 50000
+	if len(diffContent) > maxDiffSize {
+		diffContent = diffContent[:maxDiffSize] + "\n\n... [diff truncated due to size] ..."
+	}
+	sb.WriteString("## Code Diff\n```diff\n")
+	sb.WriteString(diffContent)
+	sb.WriteString("\n```\n\n")
+
+	sb.WriteString("## Output Instructions\n")
+	sb.WriteString("Follow this template structure EXACTLY. Fill in each section based on the changes above.\n")
+	sb.WriteString("The FIRST line of your output must be the ticket title (plain text, no markdown heading).\n")
+	sb.WriteString("Everything after the first line is the ticket description in markdown.\n\n")
+	sb.WriteString("Template:\n")
+	sb.WriteString(template)
+	sb.WriteString("\n")
+
+	return sb.String()
+}
+
+// BuildEpicContentPrompt constructs a prompt for generating detailed epic content from a branch diff.
+func BuildEpicContentPrompt(diff *models.DiffResult, template string) string {
+	var sb strings.Builder
+
+	sb.WriteString("Generate a detailed GitLab epic based on the code changes below.\n")
+	sb.WriteString("Be thorough and comprehensive. Include technical details, background context, and impact analysis.\n\n")
+
+	sb.WriteString("## Branch Comparison\n")
+	sb.WriteString(fmt.Sprintf("- **Base branch:** %s\n", diff.From))
+	sb.WriteString(fmt.Sprintf("- **Feature branch:** %s\n", diff.To))
+	sb.WriteString(fmt.Sprintf("- **Files changed:** %d (+%d -%d lines)\n\n", len(diff.Files), diff.TotalAdditions, diff.TotalDeletions))
+
+	if len(diff.Commits) > 0 {
+		sb.WriteString("## Commits\n")
+		for _, msg := range diff.Commits {
+			sb.WriteString(fmt.Sprintf("- %s\n", msg))
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("## Changed Files\n")
+	for _, f := range diff.Files {
+		status := "modified"
+		if f.NewFile {
+			status = "added"
+		} else if f.Deleted {
+			status = "deleted"
+		} else if f.Renamed {
+			status = "renamed"
+		}
+		sb.WriteString(fmt.Sprintf("- `%s` (%s, +%d -%d)\n", f.NewPath, status, f.Additions, f.Deletions))
+	}
+	sb.WriteString("\n")
+
+	diffContent := diff.DiffContent
+	const maxDiffSize = 50000
+	if len(diffContent) > maxDiffSize {
+		diffContent = diffContent[:maxDiffSize] + "\n\n... [diff truncated due to size] ..."
+	}
+	sb.WriteString("## Code Diff\n```diff\n")
+	sb.WriteString(diffContent)
+	sb.WriteString("\n```\n\n")
+
+	sb.WriteString("## Output Instructions\n")
+	sb.WriteString("Follow this template structure EXACTLY. Fill in each section based on the changes above.\n")
+	sb.WriteString("Provide detailed, comprehensive content for every section.\n")
+	sb.WriteString("The FIRST line of your output must be the epic title (plain text, no markdown heading).\n")
+	sb.WriteString("Everything after the first line is the epic description in markdown.\n\n")
+	sb.WriteString("Template:\n")
+	sb.WriteString(template)
+	sb.WriteString("\n")
+
+	return sb.String()
+}
+
 // BuildSystemPrompt returns the system prompt for the AI.
 func BuildSystemPrompt() string {
 	return `You are an expert senior code reviewer with deep knowledge of software engineering best practices, security, performance optimization, and clean code principles.

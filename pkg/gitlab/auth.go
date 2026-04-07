@@ -78,28 +78,36 @@ func (c *Client) ListProjects() ([]models.ProjectInfo, error) {
 		Sort:       gogitlab.Ptr("desc"),
 		ListOptions: gogitlab.ListOptions{
 			PerPage: 50,
+			Page:    1,
 		},
 	}
 
-	projects, _, err := c.api.Projects.ListProjects(opts)
-	if err != nil {
-		return nil, utils.NewGitLabError("failed to list projects", err)
-	}
+	result := make([]models.ProjectInfo, 0, 100)
+	for {
+		projects, resp, err := c.api.Projects.ListProjects(opts)
+		if err != nil {
+			return nil, utils.NewGitLabError("failed to list projects", err)
+		}
 
-	result := make([]models.ProjectInfo, 0, len(projects))
-	for _, p := range projects {
-		info := models.ProjectInfo{
-			ID:            p.ID,
-			Name:          p.Name,
-			Path:          p.PathWithNamespace,
-			Description:   p.Description,
-			WebURL:        p.WebURL,
-			DefaultBranch: p.DefaultBranch,
+		for _, p := range projects {
+			info := models.ProjectInfo{
+				ID:            p.ID,
+				Name:          p.Name,
+				Path:          p.PathWithNamespace,
+				Description:   p.Description,
+				WebURL:        p.WebURL,
+				DefaultBranch: p.DefaultBranch,
+			}
+			if p.LastActivityAt != nil {
+				info.LastActivity = *p.LastActivityAt
+			}
+			result = append(result, info)
 		}
-		if p.LastActivityAt != nil {
-			info.LastActivity = *p.LastActivityAt
+
+		if resp.NextPage == 0 {
+			break
 		}
-		result = append(result, info)
+		opts.Page = resp.NextPage
 	}
 
 	return result, nil

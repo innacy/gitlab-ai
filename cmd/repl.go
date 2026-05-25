@@ -15,29 +15,29 @@ import (
 	"gitlab-ai/internal/models"
 	"gitlab-ai/pkg/ai"
 	"gitlab-ai/pkg/config"
-	"gitlab-ai/pkg/gitlab"
 	"gitlab-ai/pkg/output"
+	"gitlab-ai/pkg/platform"
+	_ "gitlab-ai/pkg/platform/gitlab"
 )
 
 // replState holds the interactive session state.
 type replState struct {
-	cfg      *config.AppConfig
-	glClient *gitlab.Client
+	cfg        *config.AppConfig
+	provider   platform.Provider
 	aiClient ai.ChatClient
 	rl       *readline.Instance
-	username string
+	username   string
 
 	startedAt   time.Time
 	reviews     map[string]*reviewEntry
 	reviewOrder []string
 	stats       sessionStats
 
-	activeTeam   string
-	projectCache []models.ProjectInfo
-	cacheMu      sync.RWMutex
-	cacheReady   chan struct{}
-	cacheTicker  *time.Ticker
-	cacheStop    chan struct{}
+	activeTeam      string
+	projectCache    []models.ProjectInfo
+	cacheMu         sync.RWMutex
+	cacheReady      chan struct{}
+	lastRefreshTime time.Time
 
 	idleTimer *time.Timer
 	timedOut  atomic.Bool
@@ -72,17 +72,38 @@ func (r *replState) buildCompleter() *readline.PrefixCompleter {
 		readline.PcItem("projects"),
 		readline.PcItem("tickets"),
 		readline.PcItem("ticket-open", projectDynamic),
+		readline.PcItem("ticket-open-empty"),
+		readline.PcItem("all-in-one"),
+		readline.PcItem("ticket-close", projectDynamic),
+		readline.PcItem("ticket-reopen", projectDynamic),
+		readline.PcItem("ticket-update", projectDynamic),
+		readline.PcItem("ticket-search", projectDynamic),
+		readline.PcItem("create-ticket-desc", projectDynamic),
 		readline.PcItem("tickets-black"),
 		readline.PcItem("mr-status", projectDynamic),
 		readline.PcItem("mr-open", projectDynamic),
 		readline.PcItem("mr-review", projectDynamic),
 		readline.PcItem("mr-comment", projectDynamic),
 		readline.PcItem("mr-checks", projectDynamic),
+		readline.PcItem("mr-merge", projectDynamic),
+		readline.PcItem("mr-approve", projectDynamic),
+		readline.PcItem("mr-unapprove", projectDynamic),
+		readline.PcItem("mr-rebase", projectDynamic),
+		readline.PcItem("mr-update", projectDynamic),
+		readline.PcItem("mr-close", projectDynamic),
+		readline.PcItem("mr-reopen", projectDynamic),
+		readline.PcItem("pipeline", projectDynamic),
+		readline.PcItem("pipeline-view", projectDynamic),
+		readline.PcItem("pipeline-logs", projectDynamic),
+		readline.PcItem("pipeline-retry", projectDynamic),
+		readline.PcItem("pipeline-cancel", projectDynamic),
 		readline.PcItem("diff", projectDynamic),
 		readline.PcItem("branch-cleanup", projectDynamic),
 		readline.PcItem("create-ticket-content", projectDynamic),
 		readline.PcItem("create-epic-content", projectDynamic),
 		readline.PcItem("release"),
+		readline.PcItem("config"),
+		readline.PcItem("help"),
 		readline.PcItem("exit"),
 	)
 }
@@ -133,30 +154,64 @@ func (r *replState) fetchProjectCache() {
 }
 
 func (r *replState) refreshCache() {
-	projects, err := r.glClient.ListProjects()
+	var projects []models.ProjectInfo
+	var err error
+
+	if r.lastRefreshTime.IsZero() {
+		projects, err = r.provider.Repos().ListProjects()
+	} else {
+		projects, err = r.provider.Repos().ListProjectsSince(r.lastRefreshTime, 1)
+	}
 	if err != nil {
 		return
 	}
 
-	if r.activeTeam != "" {
-		team := strings.ToLower(strings.TrimSpace(r.activeTeam))
-		filtered := make([]models.ProjectInfo, 0, len(projects))
-		for _, p := range projects {
-			path := strings.ToLower(p.Path)
-			if strings.HasPrefix(path, team+"/") || strings.Contains(path, "/"+team+"/") {
-				filtered = append(filtered, p)
-			}
-		}
-		projects = filtered
+	r.cacheMu.Lock()
+	if r.lastRefreshTime.IsZero() {
+		// First load: replace cache entirely
+		r.projectCache = r.filterByTeam(projects)
+	} else {
+		// Merge updated projects into existing cache
+		r.mergeIntoCache(r.filterByTeam(projects))
 	}
 
-	sort.Slice(projects, func(i, j int) bool {
-		return projects[i].LastActivity.After(projects[j].LastActivity)
+	sort.Slice(r.projectCache, func(i, j int) bool {
+		return r.projectCache[i].LastActivity.After(r.projectCache[j].LastActivity)
 	})
-
-	r.cacheMu.Lock()
-	r.projectCache = projects
 	r.cacheMu.Unlock()
+
+	r.lastRefreshTime = time.Now()
+}
+
+func (r *replState) filterByTeam(projects []models.ProjectInfo) []models.ProjectInfo {
+	if r.activeTeam == "" {
+		return projects
+	}
+	team := strings.ToLower(strings.TrimSpace(r.activeTeam))
+	filtered := make([]models.ProjectInfo, 0, len(projects))
+	for _, p := range projects {
+		path := strings.ToLower(p.Path)
+		if strings.HasPrefix(path, team+"/") || strings.Contains(path, "/"+team+"/") {
+			filtered = append(filtered, p)
+		}
+	}
+	return filtered
+}
+
+// mergeIntoCache upserts updated projects into the existing cache.
+// Must be called with cacheMu held.
+func (r *replState) mergeIntoCache(updated []models.ProjectInfo) {
+	index := make(map[int]int, len(r.projectCache))
+	for i, p := range r.projectCache {
+		index[p.ID] = i
+	}
+	for _, p := range updated {
+		if idx, ok := index[p.ID]; ok {
+			r.projectCache[idx] = p
+		} else {
+			r.projectCache = append(r.projectCache, p)
+		}
+	}
 }
 
 func (r *replState) refreshCacheAsync() {
@@ -176,26 +231,11 @@ func (r *replState) syncProjectCache() {
 	output.PrintSuccess(fmt.Sprintf("Synced %d projects", count))
 }
 
-func (r *replState) startCacheTicker() {
-	r.cacheTicker = time.NewTicker(5 * time.Minute)
-	r.cacheStop = make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-r.cacheTicker.C:
-				r.refreshCache()
-			case <-r.cacheStop:
-				r.cacheTicker.Stop()
-				return
-			}
-		}
-	}()
-}
-
-func (r *replState) stopCacheTicker() {
-	if r.cacheStop != nil {
-		close(r.cacheStop)
+func (r *replState) smartRefresh() {
+	if r.lastRefreshTime.IsZero() {
+		return
 	}
+	r.refreshCache()
 }
 
 func (r *replState) resolveProject(input string) string {
@@ -240,7 +280,11 @@ func (r *replState) resolveProject(input string) string {
 
 func (r *replState) resetIdle() {
 	if !r.timedOut.Load() && r.idleTimer != nil {
-		r.idleTimer.Reset(1 * time.Hour)
+		idleTimeout := time.Duration(r.cfg.CLI.IdleTimeoutMinutes) * time.Minute
+		if idleTimeout <= 0 {
+			idleTimeout = 1 * time.Hour
+		}
+		r.idleTimer.Reset(idleTimeout)
 	}
 }
 
@@ -255,11 +299,11 @@ func RunREPL(cfg *config.AppConfig) {
 	completer := r.buildCompleter()
 
 	rl, err := readline.NewEx(&readline.Config{
-		Prompt:            "gitlab-ai> ",
+		Prompt:            "git-agent> ",
 		AutoComplete:      completer,
 		InterruptPrompt:   "^C",
 		EOFPrompt:         "exit",
-		HistoryFile:       "/tmp/gitlab-ai-history.tmp",
+		HistoryFile:       "/tmp/git-agent-history.tmp",
 		HistoryLimit:      500,
 		HistorySearchFold: true,
 	})
@@ -270,43 +314,70 @@ func RunREPL(cfg *config.AppConfig) {
 	defer rl.Close()
 	r.rl = rl
 
-	cyan := color.New(color.FgCyan, color.Bold)
+	theme := output.GetTheme()
 	bold := color.New(color.Bold)
 
 	fmt.Println()
-	cyan.Println("🤖 gitlab-ai — Interactive Mode")
+	theme.Header.Println("  git-agent — Interactive Mode")
 	fmt.Println()
-	bold.Println("Commands:")
-	fmt.Println("  start                                  - Start session, pick team & list projects")
-	fmt.Println("  list                                   - List team projects")
-	fmt.Println("  ticket-open                            - Create a new ticket")
-	fmt.Println("  tickets                                - Generate open tickets report for all projects")
-	fmt.Println("  tickets-black                          - Generate malformed tickets report for all projects")
-	fmt.Println("  mr-status  <project>                   - List open/merged MRs")
+	bold.Println("Merge Requests:")
+	fmt.Println("  mr-status  <project>                   - List open MRs")
 	fmt.Println("  mr-review  <project> [mr-number]       - Review MR with AI")
 	fmt.Println("  mr-comment <project> [mr-number]       - Post review as MR comment")
 	fmt.Println("  mr-open    <project> [branch] [target] - Create a new MR")
-	fmt.Println("  mr-checks  <project> <mr-number>       - Show CI/CD pipeline status")
-	fmt.Println("  diff       <project>                   - Compare tags or branches (git diff)")
+	fmt.Println("  mr-merge   <project> <mr-number>       - Merge an MR")
+	fmt.Println("  mr-approve <project> <mr-number>       - Approve an MR")
+	fmt.Println("  mr-rebase  <project> <mr-number>       - Rebase MR source branch")
+	fmt.Println("  mr-update  <project> <mr-number>       - Update MR metadata")
+	fmt.Println("  mr-close   <project> <mr-number>       - Close an MR")
+	fmt.Println("  mr-reopen  <project> <mr-number>       - Reopen a closed MR")
+	fmt.Println("  mr-checks  <project> <mr-number>       - Show pipeline status for MR")
+	fmt.Println()
+	bold.Println("Pipelines / CI:")
+	fmt.Println("  pipeline        <project>              - List recent pipelines")
+	fmt.Println("  pipeline-view   <project> <id>         - View pipeline details & jobs")
+	fmt.Println("  pipeline-logs   <project> <job-id>     - Show job log output")
+	fmt.Println("  pipeline-retry  <project> <id>         - Retry a failed pipeline")
+	fmt.Println("  pipeline-cancel <project> <id>         - Cancel a running pipeline")
+	fmt.Println()
+	bold.Println("Tickets / Issues:")
+	fmt.Println("  ticket-open    [project]               - Create a new ticket")
+	fmt.Println("  ticket-open-empty                      - Quick-create empty ticket (assigned to you)")
+	fmt.Println("  ticket-close   <project> <number>      - Close a ticket")
+	fmt.Println("  ticket-reopen  <project> <number>      - Reopen a ticket")
+	fmt.Println("  ticket-update  <project> <number>      - Update ticket metadata")
+	fmt.Println("  ticket-search  <project>               - Search tickets")
+	fmt.Println("  tickets                                - Generate tickets report")
+	fmt.Println("  tickets-black                          - Generate malformed tickets report")
+	fmt.Println()
+	bold.Println("Repository:")
+	fmt.Println("  list / projects                        - List team projects")
+	fmt.Println("  diff           <project>               - Compare tags or branches")
 	fmt.Println("  branch-cleanup <project>               - Remove stale/merged branches")
-	fmt.Println("  create-ticket-content [project]        - Generate ticket content from branch diff")
-	fmt.Println("  create-epic-content   [project]        - Generate epic content from branch diff")
 	fmt.Println("  release                                - Check release status of all projects")
-	fmt.Println("  exit                                   - End session")
 	fmt.Println()
-	providerLabel := cfg.AI.Provider
-	if providerLabel == "" {
-		providerLabel = "anthropic"
+	bold.Println("Content Generation:")
+	fmt.Println("  create-ticket-content [project]        - Generate ticket from committed branch diff")
+	fmt.Println("  create-ticket-desc    [project]        - Generate description from linked MRs")
+	fmt.Println("  create-epic-content   [project]        - Generate epic from committed branch diff")
+	fmt.Println()
+	fmt.Println()
+	bold.Println("Workflow:")
+	fmt.Println("  all-in-one                             - Full flow: ticket → folder → commit → MR")
+	fmt.Println()
+	theme.Muted.Println("  start  - Start session  |  exit  - End session")
+	theme.Muted.Println("  Any other input is sent to AI as a question.")
+	fmt.Println()
+	idleTimeout := time.Duration(cfg.CLI.IdleTimeoutMinutes) * time.Minute
+	if idleTimeout <= 0 {
+		idleTimeout = 1 * time.Hour
 	}
-	fmt.Printf("  Any other input is sent to %s AI as a question.\n", providerLabel)
-	fmt.Println()
-	color.New(color.FgYellow).Println("Auto-exit after 1 hour of inactivity.")
-	fmt.Println()
-	dim := color.New(color.Faint)
-	dim.Println("Shortcuts: Tab = auto-complete | ↑/↓ = history | ←/→ = move cursor | Ctrl+R = search history")
+
+	theme.Warning.Printf("  Auto-exit after %s of inactivity.\n", idleTimeout)
+	theme.Muted.Println("  Shortcuts: Tab = auto-complete | ↑/↓ = history | Ctrl+R = search history")
 	fmt.Println()
 
-	r.idleTimer = time.AfterFunc(1*time.Hour, func() {
+	r.idleTimer = time.AfterFunc(idleTimeout, func() {
 		r.timedOut.Store(true)
 		rl.Close()
 	})
@@ -316,7 +387,7 @@ func RunREPL(cfg *config.AppConfig) {
 		line, err := rl.Readline()
 
 		if r.timedOut.Load() {
-			fmt.Println("\n⏰ Session timed out (1 hour of inactivity)")
+			fmt.Printf("\n⏰ Session timed out (%s of inactivity)\n", idleTimeout)
 			r.handleExit()
 			return
 		}
@@ -371,6 +442,30 @@ func (r *replState) dispatch(line string) bool {
 		r.handleMRChecks(parts[1:])
 	case "mr-open":
 		r.handleMROpen(parts[1:])
+	case "mr-merge":
+		r.handleMRMerge(parts[1:])
+	case "mr-approve":
+		r.handleMRApprove(parts[1:])
+	case "mr-unapprove":
+		r.handleMRUnapprove(parts[1:])
+	case "mr-rebase":
+		r.handleMRRebase(parts[1:])
+	case "mr-update":
+		r.handleMRUpdate(parts[1:])
+	case "mr-close":
+		r.handleMRClose(parts[1:])
+	case "mr-reopen":
+		r.handleMRReopen(parts[1:])
+	case "pipeline":
+		r.handlePipeline(parts[1:])
+	case "pipeline-view":
+		r.handlePipelineView(parts[1:])
+	case "pipeline-logs":
+		r.handlePipelineLogs(parts[1:])
+	case "pipeline-retry":
+		r.handlePipelineRetry(parts[1:])
+	case "pipeline-cancel":
+		r.handlePipelineCancel(parts[1:])
 	case "diff":
 		r.handleDiff(parts[1:])
 	case "branch-cleanup":
@@ -379,6 +474,20 @@ func (r *replState) dispatch(line string) bool {
 		r.handleTickets(parts[1:])
 	case "ticket-open":
 		r.handleTicketOpen(parts[1:])
+	case "ticket-open-empty":
+		r.handleTicketOpenEmpty(parts[1:])
+	case "all-in-one":
+		r.handleAllInOne(parts[1:])
+	case "ticket-close":
+		r.handleTicketClose(parts[1:])
+	case "ticket-reopen":
+		r.handleTicketReopen(parts[1:])
+	case "ticket-update":
+		r.handleTicketUpdate(parts[1:])
+	case "ticket-search":
+		r.handleTicketSearch(parts[1:])
+	case "create-ticket-desc":
+		r.handleTicketDescribe(parts[1:])
 	case "tickets-black":
 		r.handleTicketsBlack(parts[1:])
 	case "create-ticket-content":
@@ -387,6 +496,10 @@ func (r *replState) dispatch(line string) bool {
 		r.handleCreateEpicContent(parts[1:])
 	case "release":
 		r.handleRelease()
+	case "config":
+		r.handleConfig()
+	case "help":
+		r.showHelp()
 	case "exit":
 		r.handleExit()
 		return true
@@ -410,16 +523,21 @@ func (r *replState) dispatch(line string) bool {
 // ─── Session ─────────────────────────────────────────────────────────────────
 
 func (r *replState) ensureSession() bool {
-	if r.glClient != nil {
+	if r.provider != nil {
 		return true
 	}
 
 	output.PrintWarning("No active session — auto-starting...")
 
-	s := newSpinner(" Authenticating with GitLab...")
+	platformName := r.cfg.Platform
+	if platformName == "" {
+		platformName = "gitlab"
+	}
+
+	s := newSpinner(fmt.Sprintf(" Authenticating with %s...", platformName))
 	s.Start()
 
-	client, err := gitlab.NewClient(&r.cfg.GitLab)
+	prov, err := platform.NewProvider(r.cfg)
 	s.Stop()
 
 	if err != nil {
@@ -427,14 +545,14 @@ func (r *replState) ensureSession() bool {
 		return false
 	}
 
-	r.glClient = client
-	r.username = client.User().Username
+	r.provider = prov
+	r.username = prov.Username()
 	r.startedAt = time.Now()
 
-	user := client.User()
 	fmt.Println()
-	output.PrintSuccess(fmt.Sprintf("Authenticated as %s (@%s)", user.Name, user.Username))
-	output.PrintSuccess(fmt.Sprintf("GitLab: %s", r.cfg.GitLab.BaseURL))
+	output.PrintSuccess(fmt.Sprintf("Authenticated as %s (@%s)", prov.UserDisplayName(), prov.Username()))
+	output.PrintSuccess(fmt.Sprintf("Platform: %s", prov.Name()))
+	output.PrintURL(r.cfg.GitLab.BaseURL)
 
 	if len(r.cfg.Teams) == 1 {
 		r.activeTeam = r.cfg.Teams[0]
@@ -450,8 +568,6 @@ func (r *replState) ensureSession() bool {
 	r.cacheReady = make(chan struct{})
 	go r.fetchProjectCache()
 
-	r.startCacheTicker()
-
 	output.PrintSuccess("Session started — ready for commands")
 	fmt.Println()
 
@@ -459,7 +575,7 @@ func (r *replState) ensureSession() bool {
 }
 
 func (r *replState) handleStart() {
-	if r.glClient != nil {
+	if r.provider != nil {
 		output.PrintWarning("Session already active. Use 'exit' to end current session.")
 		return
 	}
@@ -467,7 +583,11 @@ func (r *replState) handleStart() {
 		return
 	}
 
+	s := newSpinner(" Fetching projects...")
+	s.Start()
 	projects := r.waitForCache()
+	s.Stop()
+
 	if len(projects) > 0 {
 		output.PrintSuccess(fmt.Sprintf("Loaded %d projects for team '%s'", len(projects), r.activeTeam))
 	} else {
@@ -477,22 +597,22 @@ func (r *replState) handleStart() {
 }
 
 func (r *replState) handleExit() {
-	r.stopCacheTicker()
 
 	fmt.Println()
-	if r.glClient != nil && !r.startedAt.IsZero() {
+	if r.provider != nil && !r.startedAt.IsZero() {
 		duration := time.Since(r.startedAt).Round(time.Second)
-		cyan := color.New(color.FgCyan, color.Bold)
-		cyan.Println("Session Summary")
-		fmt.Printf("  Duration:      %s\n", duration)
-		fmt.Printf("  Team:          %s\n", r.activeTeam)
-		fmt.Printf("  MRs reviewed:  %d\n", r.stats.mrsReviewed)
-		fmt.Printf("  MRs created:   %d\n", r.stats.mrsCreated)
-		fmt.Printf("  Files created: %d\n", r.stats.filesCreated)
-		fmt.Printf("  Issues viewed: %d\n", r.stats.issuesViewed)
+		output.ThemeHeader("Session Summary")
+		output.ThemeBox([]string{
+			fmt.Sprintf("Duration:      %s", duration),
+			fmt.Sprintf("Team:          %s", r.activeTeam),
+			fmt.Sprintf("MRs reviewed:  %d", r.stats.mrsReviewed),
+			fmt.Sprintf("MRs created:   %d", r.stats.mrsCreated),
+			fmt.Sprintf("Files created: %d", r.stats.filesCreated),
+			fmt.Sprintf("Issues viewed: %d", r.stats.issuesViewed),
+		})
 	}
 	fmt.Println()
-	fmt.Println("Goodbye! 👋")
+	output.GetTheme().Muted.Println("  Goodbye.")
 	fmt.Println()
 }
 

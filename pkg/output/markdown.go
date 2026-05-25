@@ -12,7 +12,7 @@ func GenerateGitLabComment(review *models.Review) string {
 	var sb strings.Builder
 
 	sb.WriteString("---\n")
-	sb.WriteString(fmt.Sprintf("🤖 **AI-Powered Review** | Generated on %s\n", review.ReviewDate.Format("2006-01-02 15:04 UTC")))
+	sb.WriteString(fmt.Sprintf("🤖 Review generated on %s\n", review.ReviewDate.Format("2006-01-02 15:04 UTC")))
 	sb.WriteString("---\n\n")
 
 	for _, section := range review.Sections {
@@ -22,7 +22,6 @@ func GenerateGitLabComment(review *models.Review) string {
 	}
 
 	sb.WriteString("---\n")
-	sb.WriteString("*This review was generated using AI (gitlab-ai CLI tool)*\n")
 
 	return sb.String()
 }

@@ -134,6 +134,7 @@ func (c *Client) ListProjectMRs(projectPath, state string, limit int) ([]models.
 		}
 		item := models.MRListItem{
 			IID:          mr.IID,
+			ProjectID:    mr.ProjectID,
 			Title:        mr.Title,
 			State:        mr.State,
 			Author:       author,
@@ -147,6 +148,51 @@ func (c *Client) ListProjectMRs(projectPath, state string, limit int) ([]models.
 		result = append(result, item)
 	}
 	return result, nil
+}
+
+// FindMRByBranches finds the most recent MR (any state) matching the given source and target branches.
+// Returns nil, nil if no MR is found.
+func (c *Client) FindMRByBranches(projectPath, source, target string) (*models.MRListItem, error) {
+	project, err := FindProject(c.api, projectPath)
+	if err != nil {
+		return nil, err
+	}
+
+	opts := &gogitlab.ListProjectMergeRequestsOptions{
+		SourceBranch: gogitlab.Ptr(source),
+		TargetBranch: gogitlab.Ptr(target),
+		OrderBy:      gogitlab.Ptr("updated_at"),
+		Sort:         gogitlab.Ptr("desc"),
+		ListOptions:  gogitlab.ListOptions{PerPage: 1},
+	}
+
+	mrs, _, err := c.api.MergeRequests.ListProjectMergeRequests(project.ID, opts)
+	if err != nil {
+		return nil, err
+	}
+	if len(mrs) == 0 {
+		return nil, nil
+	}
+
+	mr := mrs[0]
+	author := ""
+	if mr.Author != nil {
+		author = mr.Author.Username
+	}
+	item := &models.MRListItem{
+		IID:          mr.IID,
+		ProjectID:    mr.ProjectID,
+		Title:        mr.Title,
+		State:        mr.State,
+		Author:       author,
+		SourceBranch: mr.SourceBranch,
+		TargetBranch: mr.TargetBranch,
+		WebURL:       mr.WebURL,
+	}
+	if mr.UpdatedAt != nil {
+		item.UpdatedAt = *mr.UpdatedAt
+	}
+	return item, nil
 }
 
 // CreateMergeRequest creates a new MR and returns its info.
@@ -173,6 +219,7 @@ func (c *Client) CreateMergeRequest(projectPath, sourceBranch, targetBranch, tit
 
 	item := &models.MRListItem{
 		IID:          mr.IID,
+		ProjectID:    mr.ProjectID,
 		Title:        mr.Title,
 		State:        mr.State,
 		Author:       author,
@@ -253,6 +300,191 @@ func (c *Client) GetBranchDiff(projectPath, from, to string) ([]string, error) {
 		messages = append(messages, commit.Title)
 	}
 	return messages, nil
+}
+
+// GetBranchDiffFull returns a full diff result (commits, files, diff content) between two branches.
+func (c *Client) GetBranchDiffFull(projectPath, from, to string) (*models.DiffResult, error) {
+	project, err := FindProject(c.api, projectPath)
+	if err != nil {
+		return nil, err
+	}
+
+	compare, _, err := c.api.Repositories.Compare(project.ID, &gogitlab.CompareOptions{
+		From: gogitlab.Ptr(from),
+		To:   gogitlab.Ptr(to),
+	})
+	if err != nil {
+		return nil, utils.NewGitLabError(fmt.Sprintf("failed to compare %s..%s", from, to), err)
+	}
+
+	var diffParts []string
+	var fileChanges []models.DiffFile
+	totalAdditions := 0
+	totalDeletions := 0
+
+	for _, d := range compare.Diffs {
+		header := fmt.Sprintf("--- a/%s\n+++ b/%s", d.OldPath, d.NewPath)
+		diffParts = append(diffParts, header+"\n"+d.Diff)
+
+		adds, dels := countDiffLinesFromPatch(d.Diff)
+		totalAdditions += adds
+		totalDeletions += dels
+
+		fileChanges = append(fileChanges, models.DiffFile{
+			OldPath:   d.OldPath,
+			NewPath:   d.NewPath,
+			NewFile:   d.NewFile,
+			Renamed:   d.RenamedFile,
+			Deleted:   d.DeletedFile,
+			Additions: adds,
+			Deletions: dels,
+		})
+	}
+
+	var commitMessages []string
+	for _, commit := range compare.Commits {
+		commitMessages = append(commitMessages, commit.Title)
+	}
+
+	return &models.DiffResult{
+		From:           from,
+		To:             to,
+		DiffContent:    strings.Join(diffParts, "\n\n"),
+		Files:          fileChanges,
+		Commits:        commitMessages,
+		TotalAdditions: totalAdditions,
+		TotalDeletions: totalDeletions,
+	}, nil
+}
+
+func countDiffLinesFromPatch(patch string) (additions, deletions int) {
+	for _, line := range strings.Split(patch, "\n") {
+		if strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+			additions++
+		} else if strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---") {
+			deletions++
+		}
+	}
+	return
+}
+
+// GetMRDiff returns the diff for a merge request by project path.
+func (c *Client) GetMRDiff(projectPath string, mrIID int) (*models.DiffResult, error) {
+	project, err := FindProject(c.api, projectPath)
+	if err != nil {
+		return nil, err
+	}
+	return c.GetMRDiffByProjectID(project.ID, mrIID)
+}
+
+// GetMRDiffByProjectID returns the diff for a merge request using the numeric project ID.
+// Uses the MR changes API first, falls back to SHA-based compare.
+func (c *Client) GetMRDiffByProjectID(projectID, mrIID int) (*models.DiffResult, error) {
+	changes, _, err := c.api.MergeRequests.GetMergeRequestChanges(projectID, mrIID, nil)
+	if err == nil && len(changes.Changes) > 0 {
+		return buildDiffFromChanges(changes), nil
+	}
+
+	mr, _, mrErr := c.api.MergeRequests.GetMergeRequest(projectID, mrIID, nil)
+	if mrErr != nil {
+		if err != nil {
+			return nil, utils.NewGitLabError(fmt.Sprintf("failed to get changes for MR !%d", mrIID), err)
+		}
+		return nil, utils.NewGitLabError(fmt.Sprintf("failed to get MR !%d", mrIID), mrErr)
+	}
+
+	baseSha := mr.DiffRefs.BaseSha
+	headSha := mr.DiffRefs.HeadSha
+	if baseSha == "" || headSha == "" {
+		if err != nil {
+			return nil, utils.NewGitLabError(fmt.Sprintf("failed to get changes for MR !%d", mrIID), err)
+		}
+		return nil, fmt.Errorf("MR !%d has no diff refs", mrIID)
+	}
+
+	compare, _, cmpErr := c.api.Repositories.Compare(projectID, &gogitlab.CompareOptions{
+		From: gogitlab.Ptr(baseSha),
+		To:   gogitlab.Ptr(headSha),
+	})
+	if cmpErr != nil {
+		return nil, utils.NewGitLabError(fmt.Sprintf("failed to compare SHAs for MR !%d", mrIID), cmpErr)
+	}
+
+	return buildDiffFromCompare(compare, mr.TargetBranch, mr.SourceBranch), nil
+}
+
+func buildDiffFromChanges(changes *gogitlab.MergeRequest) *models.DiffResult {
+	var diffParts []string
+	var fileChanges []models.DiffFile
+	totalAdds, totalDels := 0, 0
+
+	for _, ch := range changes.Changes {
+		header := fmt.Sprintf("--- a/%s\n+++ b/%s", ch.OldPath, ch.NewPath)
+		diffParts = append(diffParts, header+"\n"+ch.Diff)
+
+		adds, dels := countDiffLinesFromPatch(ch.Diff)
+		totalAdds += adds
+		totalDels += dels
+
+		fileChanges = append(fileChanges, models.DiffFile{
+			OldPath:   ch.OldPath,
+			NewPath:   ch.NewPath,
+			NewFile:   ch.NewFile,
+			Renamed:   ch.RenamedFile,
+			Deleted:   ch.DeletedFile,
+			Additions: adds,
+			Deletions: dels,
+		})
+	}
+
+	return &models.DiffResult{
+		From:           changes.TargetBranch,
+		To:             changes.SourceBranch,
+		DiffContent:    strings.Join(diffParts, "\n\n"),
+		Files:          fileChanges,
+		TotalAdditions: totalAdds,
+		TotalDeletions: totalDels,
+	}
+}
+
+func buildDiffFromCompare(compare *gogitlab.Compare, from, to string) *models.DiffResult {
+	var diffParts []string
+	var fileChanges []models.DiffFile
+	totalAdds, totalDels := 0, 0
+
+	for _, d := range compare.Diffs {
+		header := fmt.Sprintf("--- a/%s\n+++ b/%s", d.OldPath, d.NewPath)
+		diffParts = append(diffParts, header+"\n"+d.Diff)
+
+		adds, dels := countDiffLinesFromPatch(d.Diff)
+		totalAdds += adds
+		totalDels += dels
+
+		fileChanges = append(fileChanges, models.DiffFile{
+			OldPath:   d.OldPath,
+			NewPath:   d.NewPath,
+			NewFile:   d.NewFile,
+			Renamed:   d.RenamedFile,
+			Deleted:   d.DeletedFile,
+			Additions: adds,
+			Deletions: dels,
+		})
+	}
+
+	var commits []string
+	for _, c := range compare.Commits {
+		commits = append(commits, c.Title)
+	}
+
+	return &models.DiffResult{
+		From:           from,
+		To:             to,
+		DiffContent:    strings.Join(diffParts, "\n\n"),
+		Files:          fileChanges,
+		Commits:        commits,
+		TotalAdditions: totalAdds,
+		TotalDeletions: totalDels,
+	}
 }
 
 // CountMRChanges computes additions and deletions from the diff.

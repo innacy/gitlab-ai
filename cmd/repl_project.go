@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +13,7 @@ import (
 
 	"gitlab-ai/internal/models"
 	"gitlab-ai/pkg/output"
+	"gitlab-ai/pkg/platform"
 )
 
 // ─── List ────────────────────────────────────────────────────────────────────
@@ -28,7 +30,7 @@ func (r *replState) handleList() {
 		s.Start()
 
 		var err error
-		projects, err = r.glClient.ListProjects()
+		projects, err = r.provider.Repos().ListProjects()
 		s.Stop()
 
 		if err != nil {
@@ -65,7 +67,7 @@ func (r *replState) handleBranchCleanup(args []string) {
 	s.Suffix = fmt.Sprintf(" Scanning branches in '%s'...", project)
 	s.Start()
 
-	merged, err := r.glClient.ListMergedBranches(project)
+	merged, err := r.provider.Repos().ListMergedBranches(project)
 	s.Stop()
 
 	if err != nil {
@@ -90,7 +92,7 @@ func (r *replState) handleBranchCleanup(args []string) {
 
 	deleted := 0
 	for _, b := range merged {
-		err := r.glClient.DeleteBranch(project, b.Name)
+		err := r.provider.Repos().DeleteBranch(project, b.Name)
 		if err != nil {
 			output.PrintError(fmt.Sprintf("  Failed to delete '%s': %v", b.Name, err))
 		} else {
@@ -138,7 +140,7 @@ func (r *replState) handleTickets(args []string) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			result, err := r.glClient.ListProjectIssues(project, models.IssueFilter{State: "opened"})
+			result, err := r.provider.Issues().ListProjectIssues(project, models.IssueFilter{State: "opened"})
 			if err != nil {
 				ch <- projectIssues{project: project, err: err}
 				return
@@ -189,7 +191,8 @@ func (r *replState) handleTickets(args []string) {
 	if errorCount > 0 {
 		output.PrintWarning(fmt.Sprintf("Completed with %d project fetch errors. See markdown report for available data.", errorCount))
 	}
-	output.PrintSuccess(fmt.Sprintf("Tickets report saved to: %s", filename))
+	output.PrintSuccess("Tickets report saved to:")
+	output.PrintFilePath(filename)
 
 	r.stats.issuesViewed += len(rows)
 	r.stats.filesCreated++
@@ -220,30 +223,53 @@ func (r *replState) handleTicketOpen(args []string) {
 		return
 	}
 
-	title, description := buildTicketContent(context)
+	var title, description string
+	if err := r.ensureAI(); err == nil {
+		s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
+		s.Suffix = " Enhancing ticket description with AI..."
+		s.Start()
+		aiTitle, aiDesc, aiErr := r.enhanceTicketDescription(context)
+		s.Stop()
+		if aiErr != nil {
+			output.PrintWarning(fmt.Sprintf("AI enhancement failed, using basic template: %v", aiErr))
+			title, description = buildTicketContent(context)
+		} else {
+			title, description = aiTitle, aiDesc
+			output.PrintSuccess("AI-enhanced ticket description ready")
+		}
+	} else {
+		output.PrintWarning("AI not available, using basic template")
+		title, description = buildTicketContent(context)
+	}
 
-	labels, err := r.glClient.ListProjectLabels(project)
+	labels, err := r.provider.Issues().ListProjectLabels(project)
 	if err != nil {
 		output.PrintWarning(fmt.Sprintf("Could not load labels for '%s': %v", project, err))
 		labels = nil
 	}
 
+	const maxLabels = 5
 	var createLabels []string
 	if len(labels) > 0 {
-		options := make([]string, 0, len(labels)+1)
-		options = append(options, labels...)
+		displayLabels := labels
+		if len(displayLabels) > maxLabels {
+			displayLabels = displayLabels[:maxLabels]
+		}
+
+		options := make([]string, 0, len(displayLabels)+1)
+		options = append(options, displayLabels...)
 		options = append(options, "— no label —")
 
 		choice := r.promptForChoice("Select label (optional)", options)
-		if choice >= 0 && choice < len(labels) {
-			createLabels = append(createLabels, labels[choice])
+		if choice >= 0 && choice < len(displayLabels) {
+			createLabels = append(createLabels, displayLabels[choice])
 		}
 	}
 
 	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
 	s.Suffix = fmt.Sprintf(" Creating ticket in '%s'...", project)
 	s.Start()
-	issue, err := r.glClient.CreateIssue(project, title, description, createLabels)
+	issue, err := r.provider.Issues().CreateIssue(project, title, description, createLabels)
 	s.Stop()
 	if err != nil {
 		output.PrintError(fmt.Sprintf("Failed to create ticket: %v", err))
@@ -258,10 +284,207 @@ func (r *replState) handleTicketOpen(args []string) {
 	} else {
 		output.PrintSuccess(fmt.Sprintf("Label: %s", strings.Join(createLabels, ", ")))
 	}
-	output.PrintSuccess(fmt.Sprintf("View at: %s", issue.WebURL))
+	output.PrintURL(issue.WebURL)
 	fmt.Println()
 
 	r.refreshCacheAsync()
+}
+
+// ─── Ticket Close ────────────────────────────────────────────────────────────
+
+func (r *replState) handleTicketClose(args []string) {
+	if !r.ensureSession() {
+		return
+	}
+	project, issueNumber := r.parseTicketArgs(args)
+	if project == "" || issueNumber <= 0 {
+		return
+	}
+
+	s := newSpinner(fmt.Sprintf(" Closing ticket #%d...", issueNumber))
+	s.Start()
+	err := r.provider.Issues().CloseIssue(project, issueNumber)
+	s.Stop()
+
+	if err != nil {
+		output.PrintError(fmt.Sprintf("Failed to close ticket: %v", err))
+		return
+	}
+	output.PrintSuccess(fmt.Sprintf("Ticket #%d closed", issueNumber))
+	fmt.Println()
+}
+
+// ─── Ticket Reopen ───────────────────────────────────────────────────────────
+
+func (r *replState) handleTicketReopen(args []string) {
+	if !r.ensureSession() {
+		return
+	}
+	project, issueNumber := r.parseTicketArgs(args)
+	if project == "" || issueNumber <= 0 {
+		return
+	}
+
+	s := newSpinner(fmt.Sprintf(" Reopening ticket #%d...", issueNumber))
+	s.Start()
+	err := r.provider.Issues().ReopenIssue(project, issueNumber)
+	s.Stop()
+
+	if err != nil {
+		output.PrintError(fmt.Sprintf("Failed to reopen ticket: %v", err))
+		return
+	}
+	output.PrintSuccess(fmt.Sprintf("Ticket #%d reopened", issueNumber))
+	fmt.Println()
+}
+
+// ─── Ticket Update ───────────────────────────────────────────────────────────
+
+func (r *replState) handleTicketUpdate(args []string) {
+	if !r.ensureSession() {
+		return
+	}
+	project, issueNumber := r.parseTicketArgs(args)
+	if project == "" || issueNumber <= 0 {
+		return
+	}
+
+	fields := []string{"Title", "Description", "Labels", "Cancel"}
+	choice := r.promptForChoice("What to update?", fields)
+	if choice < 0 || choice == 3 {
+		return
+	}
+
+	var opts platform.UpdateIssueOptions
+	switch choice {
+	case 0:
+		title := r.promptForText("new-title")
+		if title == "" {
+			output.PrintError("Title cannot be empty.")
+			return
+		}
+		opts.Title = &title
+	case 1:
+		desc := r.promptForText("new-description")
+		opts.Description = &desc
+	case 2:
+		labelsStr := r.promptForText("labels (comma-separated)")
+		if labelsStr != "" {
+			labels := strings.Split(labelsStr, ",")
+			for i := range labels {
+				labels[i] = strings.TrimSpace(labels[i])
+			}
+			opts.Labels = labels
+		}
+	}
+
+	s := newSpinner(fmt.Sprintf(" Updating ticket #%d...", issueNumber))
+	s.Start()
+	issue, err := r.provider.Issues().UpdateIssue(project, issueNumber, opts)
+	s.Stop()
+
+	if err != nil {
+		output.PrintError(fmt.Sprintf("Failed to update ticket: %v", err))
+		return
+	}
+	output.PrintSuccess(fmt.Sprintf("Ticket #%d updated: %s", issue.IID, issue.Title))
+	fmt.Println()
+}
+
+// ─── Ticket Search ───────────────────────────────────────────────────────────
+
+func (r *replState) handleTicketSearch(args []string) {
+	if !r.ensureSession() {
+		return
+	}
+
+	project := ""
+	if len(args) > 0 {
+		project = args[0]
+	}
+	if project == "" {
+		project = r.promptForProject("Select project for ticket search")
+		if project == "" {
+			output.PrintError("No project selected.")
+			return
+		}
+	}
+	project = r.resolveProject(project)
+
+	query := r.promptForText("search-query")
+	if query == "" {
+		output.PrintError("Search query cannot be empty.")
+		return
+	}
+
+	s := newSpinner(fmt.Sprintf(" Searching tickets in '%s'...", project))
+	s.Start()
+	issues, err := r.provider.Issues().SearchIssues(project, query)
+	s.Stop()
+
+	if err != nil {
+		output.PrintError(fmt.Sprintf("Search failed: %v", err))
+		return
+	}
+
+	if len(issues) == 0 {
+		output.PrintWarning("No tickets found matching the query.")
+		return
+	}
+
+	result := &models.IssueListResult{
+		ProjectName: project,
+		Issues:      issues,
+		TotalCount:  len(issues),
+	}
+	output.PrintIssuesTable(result)
+	fmt.Println()
+}
+
+// ─── Shared Ticket Arg Parser ────────────────────────────────────────────────
+
+func (r *replState) parseTicketArgs(args []string) (string, int) {
+	project, remaining := parseProjectFlag(args)
+
+	var issueNumberStr string
+	if project == "" {
+		for _, arg := range remaining {
+			if _, err := strconv.Atoi(arg); err == nil && issueNumberStr == "" {
+				issueNumberStr = arg
+			} else if project == "" {
+				project = arg
+			}
+		}
+	} else if len(remaining) > 0 {
+		issueNumberStr = remaining[0]
+	}
+
+	if project == "" {
+		project = r.promptForProject("Select project")
+		if project == "" {
+			output.PrintError("No project selected.")
+			return "", 0
+		}
+	}
+	project = r.resolveProject(project)
+
+	var issueNumber int
+	if issueNumberStr != "" {
+		n, err := strconv.Atoi(issueNumberStr)
+		if err != nil {
+			output.PrintError(fmt.Sprintf("Invalid ticket number: %s", issueNumberStr))
+			return "", 0
+		}
+		issueNumber = n
+	} else {
+		issueNumber = r.promptForNumber("Ticket number")
+		if issueNumber <= 0 {
+			output.PrintError("Invalid ticket number.")
+			return "", 0
+		}
+	}
+
+	return project, issueNumber
 }
 
 func (r *replState) handleTicketsBlack(args []string) {
@@ -298,7 +521,7 @@ func (r *replState) handleTicketsBlack(args []string) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			result, err := r.glClient.ListProjectIssues(project, models.IssueFilter{State: "opened"})
+			result, err := r.provider.Issues().ListProjectIssues(project, models.IssueFilter{State: "opened"})
 			if err != nil {
 				ch <- projectIssues{project: project, err: err}
 				return
@@ -342,7 +565,8 @@ func (r *replState) handleTicketsBlack(args []string) {
 	if errorCount > 0 {
 		output.PrintWarning(fmt.Sprintf("Completed with %d project fetch errors. See markdown report for available data.", errorCount))
 	}
-	output.PrintSuccess(fmt.Sprintf("Malformed tickets report saved to: %s", filename))
+	output.PrintSuccess("Malformed tickets report saved to:")
+	output.PrintFilePath(filename)
 	fmt.Println()
 
 	r.stats.filesCreated++
@@ -355,7 +579,7 @@ func (r *replState) allTeamProjects() []models.ProjectInfo {
 		s.Suffix = " Fetching projects..."
 		s.Start()
 
-		fetched, err := r.glClient.ListProjects()
+		fetched, err := r.provider.Repos().ListProjects()
 		s.Stop()
 		if err != nil {
 			output.PrintError(fmt.Sprintf("Failed to list projects: %v", err))
@@ -413,7 +637,7 @@ func (r *replState) handleRelease() {
 		s.Start()
 
 		var err error
-		projects, err = r.glClient.ListProjects()
+		projects, err = r.provider.Repos().ListProjects()
 		s.Stop()
 
 		if err != nil {
@@ -447,7 +671,7 @@ func (r *replState) handleRelease() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			info := r.glClient.CheckProjectRelease(proj.ID, proj.Path)
+			info := r.provider.Repos().CheckProjectRelease(proj.Path)
 			ch <- indexedResult{idx: idx, info: info}
 		}(i, p)
 	}
@@ -490,7 +714,8 @@ func (r *replState) handleRelease() {
 		return
 	}
 
-	output.PrintSuccess(fmt.Sprintf("Release report saved to: %s", filename))
+	output.PrintSuccess("Release report saved to:")
+	output.PrintFilePath(filename)
 	fmt.Println()
 
 	r.stats.filesCreated++

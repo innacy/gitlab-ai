@@ -55,6 +55,8 @@ func (c *Client) listProjectIssues(projectPath string, filter models.IssueFilter
 		opts.Page = filter.Page
 	}
 
+	singlePage := filter.PerPage > 0
+
 	var allIssues []models.Issue
 	for {
 		issues, resp, err := c.api.Issues.ListProjectIssues(project.ID, opts)
@@ -66,7 +68,7 @@ func (c *Client) listProjectIssues(projectPath string, filter models.IssueFilter
 			allIssues = append(allIssues, convertIssue(issue))
 		}
 
-		if resp.NextPage == 0 {
+		if singlePage || resp.NextPage == 0 {
 			break
 		}
 		opts.Page = resp.NextPage

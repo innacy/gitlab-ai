@@ -25,13 +25,16 @@ type AnthropicClient struct {
 }
 
 // NewAnthropicClient creates a new Anthropic API client.
-func NewAnthropicClient(apiKey, model string, maxTokens int) *AnthropicClient {
+func NewAnthropicClient(apiKey, model string, maxTokens int, timeout time.Duration) *AnthropicClient {
+	if timeout <= 0 {
+		timeout = 3 * time.Minute
+	}
 	return &AnthropicClient{
 		apiKey:    apiKey,
 		model:     model,
 		maxTokens: maxTokens,
 		httpClient: &http.Client{
-			Timeout: 3 * time.Minute, // generous timeout for large code reviews
+			Timeout: timeout,
 		},
 	}
 }

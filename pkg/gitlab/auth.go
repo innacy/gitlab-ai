@@ -3,6 +3,7 @@ package gitlab
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	gogitlab "github.com/xanzy/go-gitlab"
 
@@ -71,6 +72,16 @@ func FindProject(client *gogitlab.Client, projectPath string) (*gogitlab.Project
 
 // ListProjects returns projects accessible by the authenticated user.
 func (c *Client) ListProjects() ([]models.ProjectInfo, error) {
+	return c.listProjectsOpts(nil, 0)
+}
+
+// ListProjectsSince returns only projects with activity after the given time.
+// maxPages caps pagination (0 = unlimited).
+func (c *Client) ListProjectsSince(since time.Time, maxPages int) ([]models.ProjectInfo, error) {
+	return c.listProjectsOpts(&since, maxPages)
+}
+
+func (c *Client) listProjectsOpts(since *time.Time, maxPages int) ([]models.ProjectInfo, error) {
 	membership := true
 	opts := &gogitlab.ListProjectsOptions{
 		Membership: &membership,
@@ -81,9 +92,14 @@ func (c *Client) ListProjects() ([]models.ProjectInfo, error) {
 			Page:    1,
 		},
 	}
+	if since != nil {
+		opts.LastActivityAfter = since
+	}
 
 	result := make([]models.ProjectInfo, 0, 100)
+	page := 0
 	for {
+		page++
 		projects, resp, err := c.api.Projects.ListProjects(opts)
 		if err != nil {
 			return nil, utils.NewGitLabError("failed to list projects", err)
@@ -105,6 +121,9 @@ func (c *Client) ListProjects() ([]models.ProjectInfo, error) {
 		}
 
 		if resp.NextPage == 0 {
+			break
+		}
+		if maxPages > 0 && page >= maxPages {
 			break
 		}
 		opts.Page = resp.NextPage

@@ -22,13 +22,16 @@ type GeminiClient struct {
 }
 
 // NewGeminiClient creates a new Gemini API client.
-func NewGeminiClient(apiKey, model string, maxTokens int) *GeminiClient {
+func NewGeminiClient(apiKey, model string, maxTokens int, timeout time.Duration) *GeminiClient {
+	if timeout <= 0 {
+		timeout = 3 * time.Minute
+	}
 	return &GeminiClient{
 		apiKey:    apiKey,
 		model:     model,
 		maxTokens: maxTokens,
 		httpClient: &http.Client{
-			Timeout: 3 * time.Minute, // generous timeout for large code reviews
+			Timeout: timeout,
 		},
 	}
 }

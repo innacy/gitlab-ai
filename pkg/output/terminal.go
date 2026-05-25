@@ -13,27 +13,37 @@ import (
 )
 
 var (
-	successIcon = color.GreenString("✓")
 	warningIcon = color.YellowString("⚠")
-	errorIcon   = color.RedString("✗")
 )
 
-// PrintSuccess prints a success message.
 func PrintSuccess(msg string) {
-	fmt.Printf("%s %s\n", successIcon, msg)
+	t := GetTheme()
+	t.Success.Print("  ✓ ")
+	fmt.Println(msg)
 }
 
-// PrintWarning prints a warning message.
 func PrintWarning(msg string) {
-	fmt.Printf("%s %s\n", warningIcon, msg)
+	t := GetTheme()
+	t.Warning.Print("  ⚠ ")
+	fmt.Println(msg)
 }
 
-// PrintError prints an error message.
 func PrintError(msg string) {
-	fmt.Printf("%s %s\n", errorIcon, msg)
+	t := GetTheme()
+	t.Error.Print("  ✗ ")
+	fmt.Println(msg)
 }
 
-// PrintMRInfo displays merge request information.
+func PrintURL(url string) {
+	t := GetTheme()
+	t.Accent.Printf("    → %s\n", url)
+}
+
+func PrintFilePath(path string) {
+	t := GetTheme()
+	t.Accent.Printf("    → %s\n", path)
+}
+
 func PrintMRInfo(mr *models.MergeRequestInfo) {
 	additions, deletions := countChanges(mr)
 	PrintSuccess(fmt.Sprintf("MR fetched: \"%s\"", mr.Title))
@@ -222,6 +232,48 @@ func PrintBranchesTable(branches []models.BranchInfo, title string) {
 	table.Render()
 }
 
+// PrintPipelinesTable displays a list of pipelines in a table.
+func PrintPipelinesTable(pipelines []models.PipelineInfo, title string) {
+	fmt.Println()
+	headerColor := color.New(color.FgCyan, color.Bold)
+	headerColor.Println(title)
+	fmt.Println()
+
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"ID", "Status", "Ref", "URL"})
+	table.SetBorders(tablewriter.Border{Left: true, Top: true, Right: true, Bottom: true})
+	table.SetCenterSeparator("┼")
+	table.SetColumnSeparator("│")
+	table.SetRowSeparator("─")
+	table.SetHeaderAlignment(tablewriter.ALIGN_LEFT)
+	table.SetAlignment(tablewriter.ALIGN_LEFT)
+
+	for _, pl := range pipelines {
+		icon := "⬜"
+		switch pl.Status {
+		case "success":
+			icon = "✅"
+		case "failed":
+			icon = "❌"
+		case "running":
+			icon = "🔄"
+		case "pending":
+			icon = "⏳"
+		case "canceled":
+			icon = "🚫"
+		}
+		table.Append([]string{
+			fmt.Sprintf("%d", pl.ID),
+			fmt.Sprintf("%s %s", icon, pl.Status),
+			pl.Ref,
+			pl.WebURL,
+		})
+	}
+
+	table.Render()
+	fmt.Printf("\nTotal: %d pipelines\n", len(pipelines))
+}
+
 // PrintPipelineStatus displays CI/CD pipeline status with jobs.
 func PrintPipelineStatus(pipeline *models.PipelineInfo) {
 	fmt.Println()
@@ -240,7 +292,7 @@ func PrintPipelineStatus(pipeline *models.PipelineInfo) {
 	statusColor.Printf("Status: %s\n", strings.ToUpper(pipeline.Status))
 
 	if pipeline.WebURL != "" {
-		fmt.Printf("URL: %s\n", pipeline.WebURL)
+		PrintURL(pipeline.WebURL)
 	}
 	fmt.Println()
 

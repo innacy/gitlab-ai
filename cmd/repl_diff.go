@@ -57,7 +57,7 @@ func (r *replState) handleDiff(args []string) {
 	s.Suffix = fmt.Sprintf(" Fetching diff %s..%s from '%s'...", from, to, project)
 	s.Start()
 
-	diffResult, err := r.glClient.GetRefDiff(project, from, to)
+	diffResult, err := r.provider.Repos().GetRefDiff(project, from, to)
 	s.Stop()
 
 	if err != nil {
@@ -89,7 +89,8 @@ func (r *replState) handleDiff(args []string) {
 			output.PrintError(fmt.Sprintf("Failed to save diff: %v", err))
 			return
 		}
-		output.PrintSuccess(fmt.Sprintf("Diff is large (%d lines). Saved to: %s", len(strings.Split(diffContent, "\n")), filename))
+		output.PrintSuccess(fmt.Sprintf("Diff is large (%d lines). Saved to:", len(strings.Split(diffContent, "\n"))))
+		output.PrintFilePath(filename)
 		r.stats.filesCreated++
 	} else {
 		fmt.Println()
@@ -103,7 +104,7 @@ func (r *replState) promptForTwoTags(project string) (string, string) {
 	s.Suffix = fmt.Sprintf(" Fetching tags from '%s'...", project)
 	s.Start()
 
-	tags, err := r.glClient.ListTags(project, 20)
+	tags, err := r.provider.Repos().ListTags(project, 20)
 	s.Stop()
 
 	if err != nil {
@@ -153,7 +154,7 @@ func (r *replState) promptForTwoBranches(project string) (string, string) {
 	s.Suffix = fmt.Sprintf(" Fetching branches from '%s'...", project)
 	s.Start()
 
-	branches, err := r.glClient.ListBranches(project, 20)
+	branches, err := r.provider.Repos().ListBranches(project, 20)
 	s.Stop()
 
 	if err != nil {

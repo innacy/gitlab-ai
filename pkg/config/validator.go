@@ -58,18 +58,9 @@ func validateGitLab(cfg *GitLabConfig, ve *ValidationError) {
 }
 
 func validateAI(cfg *AIConfig, ve *ValidationError) {
-	if cfg.Provider != "" && cfg.Provider != "anthropic" {
-		ve.Errors = append(ve.Errors, fmt.Sprintf("ai.provider '%s' is not supported (use: anthropic)", cfg.Provider))
-	}
-
-	if cfg.Anthropic.Model == "" {
-		ve.Errors = append(ve.Errors, "ai.anthropic.model is required")
-	}
-	if cfg.Anthropic.MaxTokens <= 0 {
-		ve.Errors = append(ve.Errors, "ai.anthropic.max_tokens must be > 0")
-	}
-	if cfg.Anthropic.Temperature < 0 || cfg.Anthropic.Temperature > 1 {
-		ve.Errors = append(ve.Errors, "ai.anthropic.temperature must be between 0 and 1")
+	supported := map[string]bool{"anthropic": true, "claude": true, "gemini": true, "google": true, "nvidia": true, "": true}
+	if !supported[strings.ToLower(cfg.Provider)] {
+		ve.Errors = append(ve.Errors, fmt.Sprintf("ai.provider '%s' is not supported (use: anthropic, gemini, nvidia)", cfg.Provider))
 	}
 }
 

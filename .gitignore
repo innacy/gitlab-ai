@@ -34,6 +34,11 @@ Thumbs.db
 # Local project context (indexed code, review history)
 .context/
 
-# Config with secrets (lives in ~/.gitlab-ai/)
+# Config with secrets
 config.yaml
 !configs/default.yaml
+
+# Claude flow and context
+.claude-flow/*
+.claude/*
+CLAUDE.md

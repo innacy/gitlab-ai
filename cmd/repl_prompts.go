@@ -31,23 +31,41 @@ func (r *replState) interactiveSelect(title string, options []string) int {
 	}
 	defer term.Restore(fd, oldState)
 
+	// Truncate options that exceed terminal width to prevent line wrapping,
+	// which breaks the ANSI cursor positioning math in this menu.
+	width, _, _ := term.GetSize(fd)
+	if width <= 0 {
+		width = 80
+	}
+	numDigits := len(strconv.Itoa(len(options)))
+	prefixLen := 6 + numDigits
+	maxOptLen := width - prefixLen
+	display := make([]string, len(options))
+	for i, opt := range options {
+		if maxOptLen > 3 && len(opt) > maxOptLen {
+			display[i] = opt[:maxOptLen-3] + "..."
+		} else {
+			display[i] = opt
+		}
+	}
+
 	selected := 0
-	numOpts := len(options)
+	numOpts := len(display)
 
 	write := func(s string) { os.Stdout.WriteString(s) }
 
 	renderOption := func(i int, highlighted bool) {
 		write("\r\033[K")
 		if highlighted {
-			write(fmt.Sprintf("  \033[1;32m❯ %d. %s\033[0m\r\n", i+1, options[i]))
+			write(fmt.Sprintf("  \033[1;32m❯ %d. %s\033[0m\r\n", i+1, display[i]))
 		} else {
-			write(fmt.Sprintf("    %d. %s\r\n", i+1, options[i]))
+			write(fmt.Sprintf("    %d. %s\r\n", i+1, display[i]))
 		}
 	}
 
 	write("\r\n")
 	write(fmt.Sprintf("  \033[1;36m%s\033[0m\r\n", title))
-	for i := range options {
+	for i := range display {
 		renderOption(i, i == selected)
 	}
 
@@ -131,7 +149,7 @@ func (r *replState) fallbackChoice(title string, options []string) int {
 	fmt.Println()
 
 	r.rl.SetPrompt("choice> ")
-	defer r.rl.SetPrompt("gitlab-ai> ")
+	defer r.rl.SetPrompt("git-agent> ")
 
 	line, err := r.rl.Readline()
 	r.resetIdle()
@@ -177,6 +195,8 @@ func (r *replState) promptForProject(title string) string {
 		}
 	}
 
+	r.smartRefresh()
+
 	for {
 		recent := r.recentProjects(5)
 
@@ -205,7 +225,7 @@ func (r *replState) promptForProject(title string) string {
 		color.New(color.FgCyan, color.Bold).Println("  Enter project name or path (Tab to auto-complete):")
 
 		r.rl.SetPrompt("project> ")
-		defer r.rl.SetPrompt("gitlab-ai> ")
+		defer r.rl.SetPrompt("git-agent> ")
 
 		line, err := r.rl.Readline()
 		r.resetIdle()
@@ -219,7 +239,7 @@ func (r *replState) promptForProject(title string) string {
 
 func (r *replState) promptForNumber(label string) int {
 	r.rl.SetPrompt(fmt.Sprintf("%s> ", label))
-	defer r.rl.SetPrompt("gitlab-ai> ")
+	defer r.rl.SetPrompt("git-agent> ")
 
 	line, err := r.rl.Readline()
 	r.resetIdle()
@@ -246,7 +266,7 @@ func (r *replState) promptForYesNo(question string) bool {
 
 func (r *replState) promptForText(label string) string {
 	r.rl.SetPrompt(fmt.Sprintf("%s> ", label))
-	defer r.rl.SetPrompt("gitlab-ai> ")
+	defer r.rl.SetPrompt("git-agent> ")
 
 	line, err := r.rl.Readline()
 	r.resetIdle()

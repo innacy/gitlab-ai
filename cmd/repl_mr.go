@@ -8,12 +8,11 @@ import (
 	"time"
 
 	"github.com/briandowns/spinner"
-	"github.com/fatih/color"
 
 	"gitlab-ai/internal/models"
 	projectctx "gitlab-ai/pkg/context"
-	"gitlab-ai/pkg/gitlab"
 	"gitlab-ai/pkg/output"
+	"gitlab-ai/pkg/platform"
 )
 
 // ─── MR Review ───────────────────────────────────────────────────────────────
@@ -63,7 +62,7 @@ func (r *replState) handleMRReview(args []string) {
 		s.Suffix = fmt.Sprintf(" Fetching open MRs from '%s'...", project)
 		s.Start()
 
-		openMRs, err := r.glClient.ListProjectMRs(project, "opened", 5)
+		openMRs, err := r.provider.MRs().ListProjectMRs(project, "opened", 5)
 		s.Stop()
 
 		if err != nil {
@@ -92,7 +91,7 @@ func (r *replState) handleMRReview(args []string) {
 	s.Suffix = fmt.Sprintf(" Fetching MR #%d from '%s'...", mrNumber, project)
 	s.Start()
 
-	mrInfo, err := r.glClient.GetMergeRequest(project, mrNumber)
+	mrInfo, err := r.provider.MRs().GetMergeRequest(project, mrNumber)
 	s.Stop()
 
 	if err != nil {
@@ -131,7 +130,7 @@ func (r *replState) handleMRReview(args []string) {
 	output.PrintSuccess("AI review generated")
 
 	sections := parseReviewSections(reviewText)
-	additions, deletions := gitlab.CountMRChanges(mrInfo.Changes)
+	additions, deletions := r.provider.MRs().CountMRChanges(mrInfo.Changes)
 
 	review := &models.Review{
 		ProjectName:  project,
@@ -159,7 +158,8 @@ func (r *replState) handleMRReview(args []string) {
 		return
 	}
 
-	output.PrintSuccess(fmt.Sprintf("Review saved to: %s", filename))
+	output.PrintSuccess("Review saved to:")
+	output.PrintFilePath(filename)
 
 	if err := projectctx.AppendMRReview(project, mrNumber, mrInfo.Title, reviewText); err != nil {
 		output.PrintWarning(fmt.Sprintf("Could not update project context: %v", err))
@@ -263,7 +263,7 @@ func (r *replState) postReviewComment(project string, mrNumber int) {
 	s.Suffix = fmt.Sprintf(" Posting review to MR #%d...", mrNumber)
 	s.Start()
 
-	noteURL, err := r.glClient.PostMRComment(project, mrNumber, entry.comment)
+	noteURL, err := r.provider.MRs().PostMRComment(project, mrNumber, entry.comment)
 	s.Stop()
 
 	if err != nil {
@@ -272,7 +272,7 @@ func (r *replState) postReviewComment(project string, mrNumber int) {
 	}
 
 	output.PrintSuccess(fmt.Sprintf("Review posted to MR #%d", mrNumber))
-	output.PrintSuccess(fmt.Sprintf("View at: %s", noteURL))
+	output.PrintURL(noteURL)
 	fmt.Println()
 }
 
@@ -301,7 +301,7 @@ func (r *replState) handleMRStatus(args []string) {
 	s.Suffix = fmt.Sprintf(" Fetching MRs from '%s'...", project)
 	s.Start()
 
-	openMRs, err := r.glClient.ListProjectMRs(project, "opened", 20)
+	openMRs, err := r.provider.MRs().ListProjectMRs(project, "opened", 20)
 	s.Stop()
 
 	if err != nil {
@@ -372,7 +372,7 @@ func (r *replState) handleMRChecks(args []string) {
 	s.Suffix = fmt.Sprintf(" Fetching pipeline for MR #%d...", mrNumber)
 	s.Start()
 
-	pipeline, err := r.glClient.GetMRPipeline(project, mrNumber)
+	pipeline, err := r.provider.MRs().GetMRPipeline(project, mrNumber)
 	s.Stop()
 
 	if err != nil {
@@ -417,7 +417,7 @@ func (r *replState) handleMROpen(args []string) {
 		s.Suffix = fmt.Sprintf(" Fetching branches from '%s'...", project)
 		s.Start()
 
-		branches, err := r.glClient.ListActiveBranches(project, 5)
+		branches, err := r.provider.Repos().ListActiveBranches(project, 5)
 		s.Stop()
 
 		if err != nil {
@@ -451,21 +451,16 @@ func (r *replState) handleMROpen(args []string) {
 	}
 
 	title := branchToMRTitle(sourceBranch)
-	if bInfo, err := r.glClient.GetBranch(project, sourceBranch); err == nil && bInfo.CommitTitle != "" {
+	if bInfo, err := r.provider.Repos().GetBranch(project, sourceBranch); err == nil && bInfo.CommitTitle != "" {
 		title = bInfo.CommitTitle
-		if idx := strings.Index(title, "): "); idx != -1 {
-			title = strings.TrimSpace(title[idx+3:])
-		} else if idx := strings.Index(title, ": "); idx != -1 {
-			title = strings.TrimSpace(title[idx+2:])
-		}
 	}
 
 	fmt.Println()
 	s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
-	s.Suffix = " Generating MR description with AI..."
+	s.Suffix = " Generating MR description..."
 	s.Start()
 
-	description, err := r.generateMRDescription(project, sourceBranch, targetBranch)
+	description, _, err := r.generateMRDescription(project, sourceBranch, targetBranch)
 	s.Stop()
 
 	if err != nil {
@@ -477,7 +472,7 @@ func (r *replState) handleMROpen(args []string) {
 	s.Suffix = fmt.Sprintf(" Creating MR: %s → %s...", sourceBranch, targetBranch)
 	s.Start()
 
-	mr, err := r.glClient.CreateMergeRequest(project, sourceBranch, targetBranch, title, description)
+	mr, err := r.provider.MRs().CreateMergeRequest(project, sourceBranch, targetBranch, title, description)
 	s.Stop()
 
 	if err != nil {
@@ -488,9 +483,255 @@ func (r *replState) handleMROpen(args []string) {
 	fmt.Println()
 	output.PrintSuccess(fmt.Sprintf("MR #%d created: %s", mr.IID, mr.Title))
 	output.PrintSuccess(fmt.Sprintf("Branch: %s → %s", sourceBranch, targetBranch))
-	color.New(color.FgCyan, color.Bold).Printf("  🔗 %s\n", mr.WebURL)
+	output.PrintURL(mr.WebURL)
 	fmt.Println()
 
 	r.stats.mrsCreated++
 	r.refreshCacheAsync()
+}
+
+// ─── MR Merge ────────────────────────────────────────────────────────────────
+
+func (r *replState) handleMRMerge(args []string) {
+	if !r.ensureSession() {
+		return
+	}
+	project, mrNumber := r.parseMRArgs(args)
+	if project == "" || mrNumber <= 0 {
+		return
+	}
+
+	squash := r.promptForYesNo("Squash commits?")
+	removeSource := r.promptForYesNo("Remove source branch after merge?")
+
+	s := newSpinner(fmt.Sprintf(" Merging MR #%d...", mrNumber))
+	s.Start()
+	err := r.provider.MRs().MergeMR(project, mrNumber, platform.MergeOptions{
+		Squash:             squash,
+		RemoveSourceBranch: removeSource,
+	})
+	s.Stop()
+
+	if err != nil {
+		output.PrintError(fmt.Sprintf("Failed to merge MR: %v", err))
+		return
+	}
+
+	output.PrintSuccess(fmt.Sprintf("MR #%d merged successfully", mrNumber))
+	fmt.Println()
+}
+
+// ─── MR Approve / Unapprove ─────────────────────────────────────────────────
+
+func (r *replState) handleMRApprove(args []string) {
+	if !r.ensureSession() {
+		return
+	}
+	project, mrNumber := r.parseMRArgs(args)
+	if project == "" || mrNumber <= 0 {
+		return
+	}
+
+	s := newSpinner(fmt.Sprintf(" Approving MR #%d...", mrNumber))
+	s.Start()
+	err := r.provider.MRs().ApproveMR(project, mrNumber)
+	s.Stop()
+
+	if err != nil {
+		output.PrintError(fmt.Sprintf("Failed to approve MR: %v", err))
+		return
+	}
+	output.PrintSuccess(fmt.Sprintf("MR #%d approved", mrNumber))
+	fmt.Println()
+}
+
+func (r *replState) handleMRUnapprove(args []string) {
+	if !r.ensureSession() {
+		return
+	}
+	project, mrNumber := r.parseMRArgs(args)
+	if project == "" || mrNumber <= 0 {
+		return
+	}
+
+	s := newSpinner(fmt.Sprintf(" Removing approval from MR #%d...", mrNumber))
+	s.Start()
+	err := r.provider.MRs().UnapproveMR(project, mrNumber)
+	s.Stop()
+
+	if err != nil {
+		output.PrintError(fmt.Sprintf("Failed to unapprove MR: %v", err))
+		return
+	}
+	output.PrintSuccess(fmt.Sprintf("MR #%d approval removed", mrNumber))
+	fmt.Println()
+}
+
+// ─── MR Rebase ───────────────────────────────────────────────────────────────
+
+func (r *replState) handleMRRebase(args []string) {
+	if !r.ensureSession() {
+		return
+	}
+	project, mrNumber := r.parseMRArgs(args)
+	if project == "" || mrNumber <= 0 {
+		return
+	}
+
+	s := newSpinner(fmt.Sprintf(" Rebasing MR #%d...", mrNumber))
+	s.Start()
+	err := r.provider.MRs().RebaseMR(project, mrNumber)
+	s.Stop()
+
+	if err != nil {
+		output.PrintError(fmt.Sprintf("Failed to rebase MR: %v", err))
+		return
+	}
+	output.PrintSuccess(fmt.Sprintf("MR #%d rebase initiated", mrNumber))
+	fmt.Println()
+}
+
+// ─── MR Update ───────────────────────────────────────────────────────────────
+
+func (r *replState) handleMRUpdate(args []string) {
+	if !r.ensureSession() {
+		return
+	}
+	project, mrNumber := r.parseMRArgs(args)
+	if project == "" || mrNumber <= 0 {
+		return
+	}
+
+	fields := []string{"Title", "Description", "Labels", "Cancel"}
+	choice := r.promptForChoice("What to update?", fields)
+	if choice < 0 || choice == 3 {
+		return
+	}
+
+	var opts platform.UpdateMROptions
+	switch choice {
+	case 0:
+		title := r.promptForText("new-title")
+		if title == "" {
+			output.PrintError("Title cannot be empty.")
+			return
+		}
+		opts.Title = &title
+	case 1:
+		desc := r.promptForText("new-description")
+		opts.Description = &desc
+	case 2:
+		labelsStr := r.promptForText("labels (comma-separated)")
+		if labelsStr != "" {
+			labels := strings.Split(labelsStr, ",")
+			for i := range labels {
+				labels[i] = strings.TrimSpace(labels[i])
+			}
+			opts.Labels = labels
+		}
+	}
+
+	s := newSpinner(fmt.Sprintf(" Updating MR #%d...", mrNumber))
+	s.Start()
+	mr, err := r.provider.MRs().UpdateMR(project, mrNumber, opts)
+	s.Stop()
+
+	if err != nil {
+		output.PrintError(fmt.Sprintf("Failed to update MR: %v", err))
+		return
+	}
+	output.PrintSuccess(fmt.Sprintf("MR #%d updated: %s", mr.IID, mr.Title))
+	fmt.Println()
+}
+
+// ─── MR Close / Reopen ──────────────────────────────────────────────────────
+
+func (r *replState) handleMRClose(args []string) {
+	if !r.ensureSession() {
+		return
+	}
+	project, mrNumber := r.parseMRArgs(args)
+	if project == "" || mrNumber <= 0 {
+		return
+	}
+
+	s := newSpinner(fmt.Sprintf(" Closing MR #%d...", mrNumber))
+	s.Start()
+	err := r.provider.MRs().CloseMR(project, mrNumber)
+	s.Stop()
+
+	if err != nil {
+		output.PrintError(fmt.Sprintf("Failed to close MR: %v", err))
+		return
+	}
+	output.PrintSuccess(fmt.Sprintf("MR #%d closed", mrNumber))
+	fmt.Println()
+}
+
+func (r *replState) handleMRReopen(args []string) {
+	if !r.ensureSession() {
+		return
+	}
+	project, mrNumber := r.parseMRArgs(args)
+	if project == "" || mrNumber <= 0 {
+		return
+	}
+
+	s := newSpinner(fmt.Sprintf(" Reopening MR #%d...", mrNumber))
+	s.Start()
+	err := r.provider.MRs().ReopenMR(project, mrNumber)
+	s.Stop()
+
+	if err != nil {
+		output.PrintError(fmt.Sprintf("Failed to reopen MR: %v", err))
+		return
+	}
+	output.PrintSuccess(fmt.Sprintf("MR #%d reopened", mrNumber))
+	fmt.Println()
+}
+
+// ─── Shared MR Arg Parser ───────────────────────────────────────────────────
+
+func (r *replState) parseMRArgs(args []string) (string, int) {
+	project, remaining := parseProjectFlag(args)
+
+	var mrNumberStr string
+	if project == "" {
+		for _, arg := range remaining {
+			if _, err := strconv.Atoi(arg); err == nil && mrNumberStr == "" {
+				mrNumberStr = arg
+			} else if project == "" {
+				project = arg
+			}
+		}
+	} else if len(remaining) > 0 {
+		mrNumberStr = remaining[0]
+	}
+
+	if project == "" {
+		project = r.promptForProject("Select project")
+		if project == "" {
+			output.PrintError("No project selected.")
+			return "", 0
+		}
+	}
+	project = r.resolveProject(project)
+
+	var mrNumber int
+	if mrNumberStr != "" {
+		n, err := strconv.Atoi(mrNumberStr)
+		if err != nil {
+			output.PrintError(fmt.Sprintf("Invalid MR number: %s", mrNumberStr))
+			return "", 0
+		}
+		mrNumber = n
+	} else {
+		mrNumber = r.promptForNumber("MR number")
+		if mrNumber <= 0 {
+			output.PrintError("Invalid MR number.")
+			return "", 0
+		}
+	}
+
+	return project, mrNumber
 }

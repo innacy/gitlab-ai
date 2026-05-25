@@ -11,6 +11,7 @@ import (
 
 // AppConfig holds the complete application configuration.
 type AppConfig struct {
+	Platform        string       `mapstructure:"platform" yaml:"platform"`
 	GitLab          GitLabConfig `mapstructure:"gitlab" yaml:"gitlab"`
 	AI              AIConfig     `mapstructure:"ai" yaml:"ai"`
 	Review          ReviewConfig `mapstructure:"review" yaml:"review"`
@@ -29,27 +30,38 @@ type GitLabConfig struct {
 	BaseURL        string `mapstructure:"base_url" yaml:"base_url"`
 	APIVersion     string `mapstructure:"api_version" yaml:"api_version"`
 	DefaultProject string `mapstructure:"default_project" yaml:"default_project"`
+	ParentFolder   string `mapstructure:"parent_folder" yaml:"parent_folder"`
 }
 
 // AIConfig holds AI provider settings.
 type AIConfig struct {
-	Provider  string          `mapstructure:"provider" yaml:"provider"`
-	Anthropic AnthropicConfig `mapstructure:"anthropic" yaml:"anthropic"`
-	Gemini    GeminiConfig    `mapstructure:"gemini" yaml:"gemini"`
+	Provider       string          `mapstructure:"provider" yaml:"provider"`
+	TimeoutSeconds int             `mapstructure:"timeout_seconds" yaml:"timeout_seconds"`
+	Anthropic      AnthropicConfig `mapstructure:"anthropic" yaml:"anthropic"`
+	Gemini         GeminiConfig    `mapstructure:"gemini" yaml:"gemini"`
+	Nvidia         NvidiaConfig    `mapstructure:"nvidia" yaml:"nvidia"`
+}
+
+// NvidiaConfig holds NVIDIA NIM-specific settings.
+type NvidiaConfig struct {
+	APIKey    string `mapstructure:"api_key" yaml:"api_key"`
+	APIKeyEnv string `mapstructure:"api_key_env" yaml:"api_key_env"`
+	Model     string `mapstructure:"model" yaml:"model"`
+	MaxTokens int    `mapstructure:"max_tokens" yaml:"max_tokens"`
 }
 
 // GeminiConfig holds Google Gemini-specific settings.
 type GeminiConfig struct {
-	APIKey    string `mapstructure:"api_key" yaml:"api_key"`         // direct key (takes priority)
-	APIKeyEnv string `mapstructure:"api_key_env" yaml:"api_key_env"` // env var name fallback
+	APIKey    string `mapstructure:"api_key" yaml:"api_key"`
+	APIKeyEnv string `mapstructure:"api_key_env" yaml:"api_key_env"`
 	Model     string `mapstructure:"model" yaml:"model"`
 	MaxTokens int    `mapstructure:"max_tokens" yaml:"max_tokens"`
 }
 
 // AnthropicConfig holds Anthropic-specific settings.
 type AnthropicConfig struct {
-	APIKey      string  `mapstructure:"api_key" yaml:"api_key"`         // direct key (takes priority)
-	APIKeyEnv   string  `mapstructure:"api_key_env" yaml:"api_key_env"` // env var name fallback
+	APIKey      string  `mapstructure:"api_key" yaml:"api_key"`
+	APIKeyEnv   string  `mapstructure:"api_key_env" yaml:"api_key_env"`
 	Model       string  `mapstructure:"model" yaml:"model"`
 	MaxTokens   int     `mapstructure:"max_tokens" yaml:"max_tokens"`
 	Temperature float64 `mapstructure:"temperature" yaml:"temperature"`
@@ -104,27 +116,27 @@ type ContentTemplateConfig struct {
 
 // CLIConfig holds CLI behavior settings.
 type CLIConfig struct {
-	ColorOutput       bool `mapstructure:"color_output" yaml:"color_output"`
-	MarkdownRendering bool `mapstructure:"markdown_rendering" yaml:"markdown_rendering"`
-	Verbose           bool `mapstructure:"verbose" yaml:"verbose"`
-	ConfirmBeforePost bool `mapstructure:"confirm_before_post" yaml:"confirm_before_post"`
+	ColorOutput        bool   `mapstructure:"color_output" yaml:"color_output"`
+	MarkdownRendering  bool   `mapstructure:"markdown_rendering" yaml:"markdown_rendering"`
+	Verbose            bool   `mapstructure:"verbose" yaml:"verbose"`
+	ConfirmBeforePost  bool   `mapstructure:"confirm_before_post" yaml:"confirm_before_post"`
+	IdleTimeoutMinutes int    `mapstructure:"idle_timeout_minutes" yaml:"idle_timeout_minutes"`
+	OutputFormat       string `mapstructure:"output_format" yaml:"output_format"`
+	Theme              string `mapstructure:"theme" yaml:"theme"`
 }
 
-// Load reads configuration from file and environment.
+// Load reads configuration from YAML file and environment variables.
 func Load() (*AppConfig, error) {
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
-	viper.AddConfigPath(".")         // project directory (primary)
-	viper.AddConfigPath("./configs") // configs subdirectory
+	viper.AddConfigPath(".")
+	viper.AddConfigPath("./configs")
 
-	// Set defaults
 	setDefaults()
 
-	// Allow environment variable overrides
 	viper.SetEnvPrefix("GITLAB_AI")
 	viper.AutomaticEnv()
 
-	// Read config file (it's OK if it doesn't exist)
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
 			return nil, fmt.Errorf("error reading config file: %w", err)

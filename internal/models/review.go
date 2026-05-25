@@ -72,6 +72,7 @@ type ReviewTemplateSection struct {
 // MRListItem represents a merge request in list views.
 type MRListItem struct {
 	IID          int       `json:"iid"`
+	ProjectID    int       `json:"project_id"`
 	Title        string    `json:"title"`
 	State        string    `json:"state"`
 	Author       string    `json:"author"`
